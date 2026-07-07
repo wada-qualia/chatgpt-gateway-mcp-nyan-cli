@@ -7,6 +7,7 @@ import time
 from urllib.error import HTTPError
 
 from gateway_cli import __main__ as cli
+from gateway_cli.browser import ThinClientBrowserRuntime
 from gateway_cli.sandbox import SandboxError, ThinClientSandbox
 
 
@@ -151,7 +152,7 @@ def test_login_reuses_saved_session_without_device_code(monkeypatch, tmp_path: P
 
 def test_cli_version(capsys) -> None:
     assert cli.main(["version"]) == 0
-    assert "gateway-cli 0.2.5" in capsys.readouterr().out
+    assert "gateway-cli 0.2.6" in capsys.readouterr().out
 
 
 def test_sandbox_blocks_parent_escape(tmp_path: Path) -> None:
@@ -299,3 +300,21 @@ def test_sandbox_write_file_guards_overwrite_and_replacement_count(tmp_path: Pat
         raise AssertionError("sandbox ignored expected_replacements")
 
     assert sandbox.read_file("a.txt")["content"] == "one two two"
+
+
+def test_browser_runtime_default_url_allowlist(tmp_path: Path) -> None:
+    runtime = ThinClientBrowserRuntime(tmp_path)
+
+    assert runtime._url_allowed("http://127.0.0.1:5173")
+    assert runtime._url_allowed("http://localhost:8000")
+    assert not runtime._url_allowed("https://example.com")
+    assert not runtime._url_allowed("file:///tmp/index.html")
+
+
+def test_browser_runtime_artifacts_stay_under_root(tmp_path: Path) -> None:
+    runtime = ThinClientBrowserRuntime(tmp_path)
+    artifact_dir = runtime._safe_artifact_dir("../../bad/session")
+
+    assert artifact_dir.exists()
+    assert artifact_dir.is_dir()
+    assert runtime.artifact_root in artifact_dir.parents

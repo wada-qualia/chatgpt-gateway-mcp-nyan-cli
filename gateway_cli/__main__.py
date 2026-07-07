@@ -15,6 +15,7 @@ from urllib.parse import urljoin, urlencode
 from urllib.request import Request, urlopen
 
 from . import __version__
+from .browser import BrowserError, ThinClientBrowserRuntime
 from .sandbox import SandboxError, ThinClientSandbox
 
 SESSION_REUSE_MIN_TTL_SECONDS = 60
@@ -154,6 +155,7 @@ async def serve_ws_once(gateway: str, client_id: str, token: str, sandbox: ThinC
     url = f"{ws_base}/api/thin-clients/ws/{client_id}?{urlencode({'token': token})}"
     async with websockets.connect(url) as websocket:
         send_lock = asyncio.Lock()
+        browser_runtime = ThinClientBrowserRuntime(sandbox.root)
 
         async def send_json(payload: dict) -> None:
             async with send_lock:
@@ -263,12 +265,22 @@ async def serve_ws_once(gateway: str, client_id: str, token: str, sandbox: ThinC
                     asyncio.create_task(terminate_monitored_command(request_id, arguments))
                     continue
                 try:
-                    result = await asyncio.to_thread(sandbox.call, tool, arguments)
+                    if tool.startswith("browser_"):
+                        result = await browser_runtime.call(tool, arguments)
+                    else:
+                        result = await asyncio.to_thread(sandbox.call, tool, arguments)
                     await send_json({"type": "tool_result", "request_id": request_id, "ok": True, "result": result})
-                except Exception as exc:
+                except (BrowserError, Exception) as exc:
                     await send_json({"type": "tool_result", "request_id": request_id, "ok": False, "error": str(exc)})
 
-        await asyncio.gather(heartbeat(), receive())
+        heartbeat_task = asyncio.create_task(heartbeat())
+        receive_task = asyncio.create_task(receive())
+        try:
+            await asyncio.gather(heartbeat_task, receive_task)
+        finally:
+            heartbeat_task.cancel()
+            receive_task.cancel()
+            await browser_runtime.close_all()
 
 
 async def serve_ws(gateway: str, client_id: str, token: str, sandbox: ThinClientSandbox) -> None:
