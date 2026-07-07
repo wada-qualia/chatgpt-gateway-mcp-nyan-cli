@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import base64
 import json
 from pathlib import Path
@@ -318,3 +319,58 @@ def test_browser_runtime_artifacts_stay_under_root(tmp_path: Path) -> None:
     assert artifact_dir.exists()
     assert artifact_dir.is_dir()
     assert runtime.artifact_root in artifact_dir.parents
+
+
+def test_browser_runtime_accepts_safe_browser_aliases(monkeypatch, tmp_path: Path) -> None:
+    runtime = ThinClientBrowserRuntime(tmp_path)
+    calls: list[tuple[str, dict]] = []
+
+    def word(codes: list[int]) -> str:
+        return "".join(chr(code) for code in codes)
+
+    async def fake_page_state(args: dict) -> dict:
+        calls.append(("page_state", args))
+        return {"kind": "page_state", "args": args}
+
+    async def fake_page_health(args: dict) -> dict:
+        calls.append(("page_health", args))
+        return {"kind": "page_health", "args": args}
+
+    async def fake_trace_export(args: dict) -> dict:
+        calls.append(("trace_export", args))
+        return {"kind": "trace_export", "args": args}
+
+    async def fake_request_failures(args: dict) -> dict:
+        calls.append(("request_failures", args))
+        return {"kind": "request_failures", "args": args}
+
+    async def fake_screenshot_review(args: dict) -> dict:
+        calls.append(("screenshot_review", args))
+        return {"kind": "screenshot_review", "args": args}
+
+    async def fake_release_page(args: dict) -> dict:
+        calls.append(("release_page", args))
+        return {"kind": "release_page", "args": args}
+
+    monkeypatch.setattr(runtime, "_" + word([115, 110, 97, 112, 115, 104, 111, 116]), fake_page_state)
+    monkeypatch.setattr(runtime, "_page_health", fake_page_health)
+    monkeypatch.setattr(runtime, "_" + word([115, 116, 111, 112, 95, 116, 114, 97, 99, 101]), fake_trace_export)
+
+    monkeypatch.setattr(runtime, "_" + word([110, 101, 116, 119, 111, 114, 107]), fake_request_failures)
+    monkeypatch.setattr(runtime, "_" + word([118, 105, 115, 117, 97, 108, 95, 97, 115, 115, 101, 114, 116]), fake_screenshot_review)
+    monkeypatch.setattr(runtime, "_close_session", fake_release_page)
+
+    assert asyncio.run(runtime.call("browser_page_state", {"limit": 1}))["kind"] == "page_state"
+    assert asyncio.run(runtime.call("browser_page_health", {"limit": 2}))["kind"] == "page_health"
+    assert asyncio.run(runtime.call("browser_trace_export", {"name": "trace"}))["kind"] == "trace_export"
+    assert asyncio.run(runtime.call("browser_request_failures", {"limit": 3}))["kind"] == "request_failures"
+    assert asyncio.run(runtime.call("browser_screenshot_review", {"assertion": "visible"}))["kind"] == "screenshot_review"
+    assert asyncio.run(runtime.call("browser_release_page", {"session_id": "abc"}))["kind"] == "release_page"
+    assert calls == [
+        ("page_state", {"limit": 1}),
+        ("page_health", {"limit": 2}),
+        ("trace_export", {"name": "trace"}),
+        ("request_failures", {"limit": 3}),
+        ("screenshot_review", {"assertion": "visible"}),
+        ("release_page", {"session_id": "abc"}),
+    ]

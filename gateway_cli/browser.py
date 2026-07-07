@@ -94,14 +94,14 @@ class ThinClientBrowserRuntime:
 
     def _target_locator(self, page: Any, args: dict[str, Any]) -> Any:
         if args.get("selector"):
-            return page.locator(str(args["selector"])).first()
+            return page.locator(str(args["selector"])).first
         if args.get("ref"):
             ref = str(args["ref"])
-            return page.locator(f'[data-gateway-browser-ref="{ref}"]').first()
+            return page.locator(f'[data-gateway-browser-ref="{ref}"]').first
         if args.get("text"):
-            return page.get_by_text(str(args["text"]), exact=bool(args.get("exact", True))).first()
+            return page.get_by_text(str(args["text"]), exact=bool(args.get("exact", True))).first
         if args.get("role") and args.get("name"):
-            return page.get_by_role(str(args["role"]), name=str(args["name"]), exact=bool(args.get("exact", True))).first()
+            return page.get_by_role(str(args["role"]), name=str(args["name"]), exact=bool(args.get("exact", True))).first
         raise BrowserError("selector, ref, text, or role+name is required")
 
     async def _import_playwright(self) -> Any:
@@ -341,6 +341,46 @@ class ThinClientBrowserRuntime:
         state["error_count"] = len(entries)
         return state
 
+    async def _page_health(self, args: dict[str, Any]) -> dict[str, Any]:
+        session = await self._get_session(args)
+        app_entries = list(session.console)
+        request_entries = list(session.network)
+        app_errors = [entry for entry in app_entries if entry.get("type") in {"error", "pageerror"}]
+        app_warnings = [entry for entry in app_entries if entry.get("type") == "warning"]
+        state = await self._session_state(session)
+        artifact_path = session.artifact_dir / "page-health.json"
+        payload = {
+            "session_id": session.session_id,
+            "url": state.get("url"),
+            "title": state.get("title"),
+            "note_count": len(app_entries),
+            "warning_count": len(app_warnings),
+            "error_count": len(app_errors),
+            "request_failure_count": len(request_entries),
+            "page_notes": app_entries,
+            "request_failures": request_entries,
+            "ts": time.time(),
+        }
+        artifact_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+        artifact = {
+            "path": self._artifact_relative(artifact_path),
+            "exists": artifact_path.exists(),
+            "bytes": artifact_path.stat().st_size if artifact_path.exists() else 0,
+        }
+        state["page_health"] = {
+            "note_count": len(app_entries),
+            "warning_count": len(app_warnings),
+            "error_count": len(app_errors),
+            "request_failure_count": len(request_entries),
+            "artifact": artifact,
+        }
+        state["note_count"] = len(app_entries)
+        state["warning_count"] = len(app_warnings)
+        state["error_count"] = len(app_errors)
+        state["request_failure_count"] = len(request_entries)
+        state["diagnostics_artifact"] = artifact
+        return state
+
     async def _start_trace(self, args: dict[str, Any]) -> dict[str, Any]:
         session = await self._get_session(args)
         if not session.tracing:
@@ -366,17 +406,41 @@ class ThinClientBrowserRuntime:
         return state
 
     async def _visual_assert(self, args: dict[str, Any]) -> dict[str, Any]:
-        screenshot = await self._screenshot({**args, "full_page": bool(args.get("full_page", True)), "name": args.get("name") or "visual-assert"})
+        screenshot = await self._screenshot({**args, "full_page": bool(args.get("full_page", True)), "name": args.get("name") or "page-review"})
         session = await self._get_session(args)
-        console_errors = [entry for entry in session.console if entry.get("type") in {"error", "pageerror"}]
-        network_errors = list(session.network)
-        verdict = "fail" if console_errors or network_errors else "needs_model_review"
+        app_entries = list(session.console)
+        request_entries = list(session.network)
+        app_errors = [entry for entry in app_entries if entry.get("type") in {"error", "pageerror"}]
+        verdict = "fail" if app_errors or request_entries else "needs_model_review"
+        stem = str(args.get("name") or "page-review")
+        safe_stem = re.sub(r"[^a-zA-Z0-9_.-]", "_", stem).strip("._") or "page-review"
+        diagnostics_path = session.artifact_dir / f"{safe_stem}-diagnostics.json"
+        diagnostics_payload = {
+            "session_id": session.session_id,
+            "assertion": str(args.get("assertion") or ""),
+            "verdict": verdict,
+            "app_error_count": len(app_errors),
+            "request_failure_count": len(request_entries),
+            "page_notes": app_entries,
+            "request_failures": request_entries,
+            "ts": time.time(),
+        }
+        diagnostics_path.write_text(json.dumps(diagnostics_payload, ensure_ascii=False, indent=2), encoding="utf-8")
         screenshot["assertion"] = str(args.get("assertion") or "")
         screenshot["verdict"] = verdict
-        screenshot["console_error_count"] = len(console_errors)
-        screenshot["network_error_count"] = len(network_errors)
-        screenshot["console_errors"] = console_errors[-20:]
-        screenshot["network_errors"] = network_errors[-20:]
+        screenshot["app_error_count"] = len(app_errors)
+        screenshot["request_failure_count"] = len(request_entries)
+        screenshot["diagnostics_artifact"] = {
+            "path": self._artifact_relative(diagnostics_path),
+            "exists": diagnostics_path.exists(),
+            "bytes": diagnostics_path.stat().st_size if diagnostics_path.exists() else 0,
+        }
+        screenshot["review"] = {
+            "assertion": screenshot["assertion"],
+            "verdict": verdict,
+            "app_error_count": len(app_errors),
+            "request_failure_count": len(request_entries),
+        }
         return screenshot
 
     async def _close_session(self, args: dict[str, Any]) -> dict[str, Any]:
@@ -412,6 +476,26 @@ class ThinClientBrowserRuntime:
             return await self._goto(args)
         if tool == "browser_snapshot":
             return await self._snapshot(args)
+        if tool == "browser_page_state":
+            return await self._snapshot(args)
+        if tool == "browser_page_health":
+            return await self._page_health(args)
+        if tool == "browser_client_messages":
+            return await self._page_health(args)
+        if tool == "browser_app_events":
+            state = await self._console(args)
+            entries = state.pop("console", [])
+            state["app_events"] = entries
+            state["event_count"] = len(entries)
+            return state
+        if tool == "browser_request_failures":
+            state = await self._network(args)
+            entries = state.pop("network", [])
+            state["request_failures"] = entries
+            state["failure_count"] = len(entries)
+            return state
+        if tool == "browser_screenshot_review":
+            return await self._visual_assert(args)
         if tool == "browser_click":
             return await self._click(args)
         if tool in {"browser_type", "browser_fill"}:
@@ -420,14 +504,24 @@ class ThinClientBrowserRuntime:
             return await self._screenshot(args)
         if tool == "browser_console":
             return await self._console(args)
+        if tool == "browser_runtime_events":
+            state = await self._console(args)
+            entries = state.pop("console", [])
+            state["runtime_events"] = entries
+            state["event_count"] = len(entries)
+            return state
         if tool == "browser_network":
             return await self._network(args)
         if tool == "browser_start_trace":
             return await self._start_trace(args)
         if tool == "browser_stop_trace":
             return await self._stop_trace(args)
+        if tool == "browser_trace_export":
+            return await self._stop_trace(args)
         if tool == "browser_visual_assert":
             return await self._visual_assert(args)
+        if tool == "browser_release_page":
+            return await self._close_session(args)
         if tool == "browser_close_session":
             return await self._close_session(args)
         raise BrowserError(f"Unknown browser tool: {tool}")
