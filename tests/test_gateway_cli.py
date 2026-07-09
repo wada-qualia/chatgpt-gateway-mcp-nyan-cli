@@ -2,14 +2,22 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import io
 import json
+import subprocess
 from pathlib import Path
+import sys
 import time
+import types
 from urllib.error import HTTPError
 
 from gateway_cli import __main__ as cli
 from gateway_cli.browser import ThinClientBrowserRuntime
 from gateway_cli.sandbox import SandboxError, ThinClientSandbox
+
+
+class NoteError(AssertionError):
+    pass
 
 
 def fake_jwt(exp: int | None = None) -> str:
@@ -30,7 +38,7 @@ def test_login_registers_current_directory(monkeypatch, tmp_path: Path, capsys) 
             return {"access_token": fake_jwt()}
         if url.endswith("/api/thin-clients/register"):
             return {"id": "client-1", "hostname": "host", "directory": payload["directory"]}
-        raise AssertionError(url)
+        raise NoteError(url)
 
     monkeypatch.setattr(cli, "request_json", fake_request_json)
 
@@ -55,7 +63,7 @@ def test_login_uses_preissued_device_code(monkeypatch, tmp_path: Path, capsys) -
             return {"access_token": fake_jwt()}
         if url.endswith("/api/thin-clients/register"):
             return {"id": "client-1", "hostname": "host", "directory": payload["directory"]}
-        raise AssertionError(url)
+        raise NoteError(url)
 
     monkeypatch.setattr(cli, "request_json", fake_request_json)
 
@@ -91,7 +99,7 @@ def test_login_tolerates_legacy_shell_comment_tail(monkeypatch, tmp_path: Path, 
             return {"access_token": fake_jwt()}
         if url.endswith("/api/thin-clients/register"):
             return {"id": "client-1", "hostname": "host", "directory": payload["directory"]}
-        raise AssertionError(url)
+        raise NoteError(url)
 
     monkeypatch.setattr(cli, "request_json", fake_request_json)
 
@@ -108,7 +116,7 @@ def test_login_reports_device_code_http_error_without_traceback(monkeypatch, tmp
     def fake_request_json(method: str, url: str, payload: dict | None = None, token: str | None = None) -> dict:
         if url.endswith("/api/thin-clients/token"):
             raise HTTPError(url, 400, "Bad Request", {}, None)
-        raise AssertionError(url)
+        raise NoteError(url)
 
     monkeypatch.setattr(cli, "request_json", fake_request_json)
     monkeypatch.setattr(cli, "http_error_message", lambda exc: "Invalid device_code")
@@ -134,10 +142,10 @@ def test_login_reuses_saved_session_without_device_code(monkeypatch, tmp_path: P
 
     def fake_request_json(method: str, url: str, payload: dict | None = None, token: str | None = None) -> dict:
         calls.append(url)
-        raise AssertionError(url)
+        raise NoteError(url)
 
-    async def fake_serve_ws(gateway: str, client_id: str, token_arg: str, sandbox: ThinClientSandbox) -> None:
-        served.append((gateway, client_id, token_arg))
+    async def fake_serve_ws(gateway: str, client_id: str, token_arg: str, sandbox: ThinClientSandbox, **kwargs) -> None:
+        served.append((gateway, client_id, token_arg, kwargs))
 
     monkeypatch.setattr(cli, "request_json", fake_request_json)
     monkeypatch.setattr(cli, "serve_ws", fake_serve_ws)
@@ -148,12 +156,495 @@ def test_login_reuses_saved_session_without_device_code(monkeypatch, tmp_path: P
     assert "reused_session" in output
     assert "client-1" in output
     assert calls == []
-    assert served == [("http://gateway", "client-1", token)]
+    assert served == [("http://gateway", "client-1", token, served[0][3])]
+    assert served[0][3]["open_timeout"] == 10.0
+    assert served[0][3]["ping_interval"] == 20.0
+    assert served[0][3]["ping_timeout"] == 20.0
+    assert served[0][3]["max_reconnect_attempts"] is None
 
 
 def test_cli_version(capsys) -> None:
     assert cli.main(["version"]) == 0
-    assert "gateway-cli 0.2.6" in capsys.readouterr().out
+    assert "gateway-cli 0.2.7" in capsys.readouterr().out
+
+
+def test_thin_client_installer_bundles_runtime_dependencies() -> None:
+    script = Path(__file__).resolve().parents[2] / "scripts" / "gateway-thin-client.sh"
+    result = subprocess.run(["sh", "-n", str(script)], check=False, capture_output=True, text=True)
+
+    assert result.returncode == 0, result.stderr
+    script_text = script.read_text()
+    assert "websockets>=12,<16" in script_text
+    assert "playwright>=1.55,<2" in script_text
+    assert "rich>=13,<15" in script_text
+
+
+def test_monitor_list_uses_saved_session_and_prints_table(monkeypatch, tmp_path: Path, capsys) -> None:
+    monkeypatch.setenv("GATEWAY_THIN_CLIENT_HOME", str(tmp_path / ".client-home"))
+    cli.save_session(
+        "http://gateway",
+        tmp_path,
+        client={"id": "client-1", "hostname": "host", "directory": str(tmp_path.resolve())},
+        token=fake_jwt(),
+    )
+    calls: list[tuple[str, str, dict | None, str | None]] = []
+
+    def fake_request_json(method: str, url: str, payload: dict | None = None, token: str | None = None) -> list[dict]:
+        calls.append((method, url, payload, token))
+        return [
+            {
+                "id": "session-1",
+                "status": "running",
+                "origin": "thin_client",
+                "line_count": 3,
+                "command": "pytest -q",
+            }
+        ]
+
+    monkeypatch.setattr(cli, "request_json", fake_request_json)
+
+    assert cli.main(["monitor", "--gateway", "http://gateway", "--directory", str(tmp_path), "list", "--status", "running"]) == 0
+
+    output = capsys.readouterr().out
+    assert "SESSION" in output
+    assert "session-1" in output
+    assert "pytest -q" in output
+    assert calls == [("GET", "http://gateway/api/command-sessions?status=running", None, calls[0][3])]
+    assert calls[0][3].startswith("header.")
+
+
+def test_monitor_tail_prints_output_lines(monkeypatch, tmp_path: Path, capsys) -> None:
+    monkeypatch.setenv("GATEWAY_THIN_CLIENT_HOME", str(tmp_path / ".client-home"))
+    cli.save_session(
+        "http://gateway",
+        tmp_path,
+        client={"id": "client-1", "hostname": "host", "directory": str(tmp_path.resolve())},
+        token=fake_jwt(),
+    )
+    calls: list[tuple[str, str, dict | None, str | None]] = []
+
+    def fake_request_json(method: str, url: str, payload: dict | None = None, token: str | None = None) -> dict:
+        calls.append((method, url, payload, token))
+        return {
+            "session_id": "session-1",
+            "lines": [
+                {"line": 7, "stream": "stdout", "text": "hello"},
+                {"line": 8, "stream": "stderr", "text": "warn"},
+            ],
+        }
+
+    monkeypatch.setattr(cli, "request_json", fake_request_json)
+
+    assert (
+        cli.main(
+            [
+                "monitor",
+                "--gateway",
+                "http://gateway",
+                "--directory",
+                str(tmp_path),
+                "tail",
+                "session-1",
+                "--tail",
+                "2",
+                "--with-metadata",
+            ]
+        )
+        == 0
+    )
+
+    output = capsys.readouterr().out
+    assert "7 stdout | hello" in output
+    assert "8 stderr | warn" in output
+    assert calls[0][0] == "GET"
+    assert calls[0][1] == "http://gateway/api/command-sessions/session-1/output?limit=200&tail=2"
+
+
+def test_monitor_kill_posts_terminate_payload(monkeypatch, tmp_path: Path, capsys) -> None:
+    monkeypatch.setenv("GATEWAY_THIN_CLIENT_HOME", str(tmp_path / ".client-home"))
+    cli.save_session(
+        "http://gateway",
+        tmp_path,
+        client={"id": "client-1", "hostname": "host", "directory": str(tmp_path.resolve())},
+        token=fake_jwt(),
+    )
+    calls: list[tuple[str, str, dict | None, str | None]] = []
+
+    def fake_request_json(method: str, url: str, payload: dict | None = None, token: str | None = None) -> dict:
+        calls.append((method, url, payload, token))
+        return {"id": "session-1", "status": "terminated"}
+
+    monkeypatch.setattr(cli, "request_json", fake_request_json)
+
+    assert cli.main(["monitor", "--gateway", "http://gateway", "--directory", str(tmp_path), "kill", "session-1", "--force"]) == 0
+
+    output = capsys.readouterr().out
+    assert "Requested termination for session-1" in output
+    assert "status=terminated" in output
+    assert calls == [("POST", "http://gateway/api/command-sessions/session-1/terminate", {"force": True}, calls[0][3])]
+
+
+def test_monitor_reports_missing_saved_session(monkeypatch, tmp_path: Path, capsys) -> None:
+    monkeypatch.setenv("GATEWAY_THIN_CLIENT_HOME", str(tmp_path / ".client-home"))
+
+    assert cli.main(["monitor", "--gateway", "http://gateway", "--directory", str(tmp_path), "list"]) == 1
+
+    captured = capsys.readouterr()
+    assert "No valid saved thin-client session found" in captured.err
+    assert "Traceback" not in captured.err
+
+
+def test_serve_ws_retries_invalid_message_without_traceback(monkeypatch, tmp_path: Path, capsys) -> None:
+    class InvalidMessage(Exception):
+        pass
+
+    class StopRetry(Exception):
+        pass
+
+    fake_websockets = types.SimpleNamespace(
+        exceptions=types.SimpleNamespace(
+            ConnectionClosed=type("ConnectionClosed", (Exception,), {}),
+            InvalidHandshake=type("InvalidHandshake", (Exception,), {}),
+            InvalidMessage=InvalidMessage,
+        )
+    )
+    monkeypatch.setitem(sys.modules, "websockets", fake_websockets)
+
+    async def fake_serve_ws_once(*args, **kwargs) -> None:
+        raise InvalidMessage("did not receive a valid HTTP response")
+
+    async def fake_sleep(delay: float) -> None:
+        assert delay == 1.0
+        raise StopRetry()
+
+    monkeypatch.setattr(cli, "serve_ws_once", fake_serve_ws_once)
+    monkeypatch.setattr(cli.asyncio, "sleep", fake_sleep)
+
+    try:
+        asyncio.run(
+            cli.serve_ws(
+                "http://gateway",
+                "client-1",
+                "token",
+                ThinClientSandbox(tmp_path),
+                reconnect_policy=cli.ReconnectPolicy(initial_delay=1.0, max_delay=1.0, jitter_ratio=0.0),
+            )
+        )
+    except StopRetry:
+        pass
+    else:
+        raise NoteError("serve_ws did not retry after InvalidMessage")
+
+    stderr = capsys.readouterr().err
+    assert "InvalidMessage: did not receive a valid HTTP response" in stderr
+    assert "next_retry=1.0s" in stderr
+    assert "Traceback" not in stderr
+
+
+def test_serve_ws_keeps_auth_close_code_fatal(monkeypatch, tmp_path: Path) -> None:
+    class ConnectionClosed(Exception):
+        def __init__(self, code: int) -> None:
+            super().__init__(f"closed {code}")
+            self.rcvd = types.SimpleNamespace(code=code)
+
+    fake_websockets = types.SimpleNamespace(exceptions=types.SimpleNamespace(ConnectionClosed=ConnectionClosed))
+    monkeypatch.setitem(sys.modules, "websockets", fake_websockets)
+
+    async def fake_serve_ws_once(*args, **kwargs) -> None:
+        raise ConnectionClosed(4401)
+
+    monkeypatch.setattr(cli, "serve_ws_once", fake_serve_ws_once)
+
+    try:
+        asyncio.run(cli.serve_ws("http://gateway", "client-1", "token", ThinClientSandbox(tmp_path)))
+    except RuntimeError as exc:
+        assert "force-auth" in str(exc)
+    else:
+        raise NoteError("serve_ws retried a fatal auth close code")
+
+
+def test_serve_ws_retry_attempt_budget(monkeypatch, tmp_path: Path) -> None:
+    class InvalidMessage(Exception):
+        pass
+
+    fake_websockets = types.SimpleNamespace(exceptions=types.SimpleNamespace(InvalidMessage=InvalidMessage))
+    monkeypatch.setitem(sys.modules, "websockets", fake_websockets)
+
+    async def fake_serve_ws_once(*args, **kwargs) -> None:
+        raise InvalidMessage("bad gateway startup response")
+
+    monkeypatch.setattr(cli, "serve_ws_once", fake_serve_ws_once)
+
+    try:
+        asyncio.run(
+            cli.serve_ws(
+                "http://gateway",
+                "client-1",
+                "token",
+                ThinClientSandbox(tmp_path),
+                max_reconnect_attempts=0,
+            )
+        )
+    except RuntimeError as exc:
+        assert "attempts exhausted" in str(exc)
+        assert "InvalidMessage" in str(exc)
+    else:
+        raise NoteError("serve_ws ignored the reconnect attempt budget")
+
+
+class FakeProcess:
+    def __init__(self, pid: int = 4242, returncode: int | None = None) -> None:
+        self.killed = False
+        self.pid = pid
+        self.returncode = returncode
+        self.terminated = False
+
+    def kill(self) -> None:
+        self.killed = True
+
+    def terminate(self) -> None:
+        self.terminated = True
+
+
+def test_local_command_registry_tracks_snapshot_terminate_and_remove() -> None:
+    registry = cli.LocalCommandRegistry()
+    process = FakeProcess(pid=111)
+
+    handle = registry.register("session-1", process, command="pytest -q", cwd=".")
+
+    assert handle.session_id == "session-1"
+    assert registry.active_count() == 1
+    assert registry.snapshot() == [
+        {
+            "command": "pytest -q",
+            "cwd": ".",
+            "pid": 111,
+            "returncode": None,
+            "session_id": "session-1",
+            "started_at": handle.started_at,
+            "status": "running",
+        }
+    ]
+
+    assert registry.terminate("session-1") is True
+    assert process.terminated is True
+    assert process.killed is False
+
+    process.returncode = 0
+    assert registry.snapshot()[0]["status"] == "finished"
+
+    registry.remove("session-1")
+    assert registry.snapshot() == []
+    assert registry.terminate("session-1", force=True) is False
+
+
+def test_local_command_registry_force_kills_process() -> None:
+    registry = cli.LocalCommandRegistry()
+    process = FakeProcess(pid=222)
+
+    registry.register("session-2", process, command="sleep 30", cwd="nested")
+
+    assert registry.terminate("session-2", force=True) is True
+    assert process.killed is True
+    assert process.terminated is False
+
+
+def test_monitored_process_snapshots_delegate_to_registry(monkeypatch) -> None:
+    registry = cli.LocalCommandRegistry()
+    process = FakeProcess(pid=333)
+    handle = registry.register("session-3", process, command="npm test", cwd="frontend")
+    monkeypatch.setattr(cli, "LOCAL_COMMAND_REGISTRY", registry)
+
+    assert cli.monitored_process_snapshots() == [
+        {
+            "command": "npm test",
+            "cwd": "frontend",
+            "pid": 333,
+            "returncode": None,
+            "session_id": "session-3",
+            "started_at": handle.started_at,
+            "status": "running",
+        }
+    ]
+
+
+def test_terminal_dashboard_plain_mode_prints_compact_state(tmp_path: Path) -> None:
+    stream = io.StringIO()
+    renderer = cli.TerminalDashboardRenderer(
+        cli.TerminalDashboardConfig(
+            client_id="client-1",
+            directory=tmp_path,
+            gateway="http://gateway",
+            hostname="host",
+            use_tui=False,
+        ),
+        stream=stream,
+    )
+
+    renderer.start()
+    renderer.update("CONNECTING")
+    renderer.update("ONLINE")
+    renderer.update("RECONNECTING", attempt=2, last_error="InvalidMessage: bad response", next_retry_seconds=3.5)
+    renderer.stop()
+
+    output = stream.getvalue()
+    assert "gateway-cli: state=INITIALIZING" in output
+    assert "gateway-cli: state=CONNECTING" in output
+    assert "gateway-cli: state=ONLINE active_commands=0" in output
+    assert "gateway-cli: state=RECONNECTING attempt=2 next_retry=3.5s last_error=InvalidMessage: bad response" in output
+
+
+def test_terminal_dashboard_records_recent_activity_in_plain_mode(tmp_path: Path) -> None:
+    stream = io.StringIO()
+    renderer = cli.TerminalDashboardRenderer(
+        cli.TerminalDashboardConfig(
+            client_id="client-1",
+            directory=tmp_path,
+            gateway="http://gateway",
+            hostname="host",
+            use_tui=False,
+        ),
+        stream=stream,
+    )
+
+    renderer.start()
+    renderer.record_event("file", "file edited", "replace docs/policy.md +1 -1", "success")
+    renderer.record_event("command", "command completed", "exit=0 cwd=. pytest -q", "success")
+    renderer.stop()
+
+    output = stream.getvalue()
+    assert "gateway-cli: event=file status=success file edited replace docs/policy.md +1 -1" in output
+    assert "gateway-cli: event=command status=success command completed exit=0 cwd=. pytest -q" in output
+    assert [event["kind"] for event in renderer.state.recent_events] == ["file", "command"]
+    assert renderer.state.recent_events[-1]["title"] == "command completed"
+
+
+def test_terminal_dashboard_rich_layout_keeps_status_in_bottom_bar(tmp_path: Path) -> None:
+    from rich.console import Console
+
+    stream = io.StringIO()
+    console = Console(file=stream, force_terminal=False, width=120, color_system=None)
+    renderer = cli.TerminalDashboardRenderer(
+        cli.TerminalDashboardConfig(
+            client_id="client-1",
+            directory=tmp_path,
+            gateway="http://gateway",
+            hostname="host",
+            use_tui=True,
+        ),
+        stream=io.StringIO(),
+    )
+    renderer.record_event("tool", "first event", "old detail", "success")
+    renderer.record_event("command", "latest event", "new detail", "success")
+    renderer.state.active_sessions = [
+        {
+            "command": "pytest -q",
+            "cwd": ".",
+            "pid": 123,
+            "returncode": None,
+            "session_id": "session-1",
+            "started_at": 1.0,
+            "status": "running",
+        }
+    ]
+
+    console.print(renderer._render_rich())
+    rendered = stream.getvalue()
+
+    assert "Event history" in rendered
+    assert "Thin client bottom bar" in rendered
+    assert "Client info" in rendered
+    assert "Active monitored commands" in rendered
+    assert rendered.index("Event history") < rendered.index("Thin client bottom bar")
+    assert rendered.index("first event") < rendered.index("latest event")
+    assert rendered.index("latest event") < rendered.index("Client info")
+    assert "session-1" in rendered
+
+
+def test_terminal_dashboard_rich_activity_keeps_newest_events_at_bottom(tmp_path: Path) -> None:
+    from rich.console import Console
+
+    stream = io.StringIO()
+    console = Console(file=stream, force_terminal=False, width=100, color_system=None)
+    renderer = cli.TerminalDashboardRenderer(
+        cli.TerminalDashboardConfig(
+            client_id="client-1",
+            directory=tmp_path,
+            gateway="http://gateway",
+            hostname="host",
+            use_tui=True,
+        ),
+        stream=io.StringIO(),
+    )
+    for index in range(12):
+        renderer.record_event("tool", f"event {index:02d}", "", "success")
+
+    console.print(renderer._render_rich_activity())
+    rendered = stream.getvalue()
+
+    assert "event 00" not in rendered
+    assert "event 01" not in rendered
+    assert "event 02" in rendered
+    assert "event 11" in rendered
+    assert rendered.index("event 02") < rendered.index("event 11")
+
+
+def test_serve_ws_updates_dashboard_states(monkeypatch, tmp_path: Path) -> None:
+    class InvalidMessage(Exception):
+        pass
+
+    class StopRetry(Exception):
+        pass
+
+    class FakeDashboard:
+        def __init__(self) -> None:
+            self.events = []
+
+        def start(self) -> None:
+            self.events.append(("START", None))
+
+        def stop(self) -> None:
+            self.events.append(("STOP", None))
+
+        def update(self, connection_state: str, **kwargs) -> None:
+            self.events.append((connection_state, kwargs))
+
+    fake_websockets = types.SimpleNamespace(exceptions=types.SimpleNamespace(InvalidMessage=InvalidMessage))
+    monkeypatch.setitem(sys.modules, "websockets", fake_websockets)
+    dashboard = FakeDashboard()
+
+    async def fake_serve_ws_once(*args, **kwargs) -> None:
+        kwargs["on_connected"]()
+        raise InvalidMessage("server restart race")
+
+    async def fake_sleep(delay: float) -> None:
+        assert delay == 1.0
+        raise StopRetry()
+
+    monkeypatch.setattr(cli, "serve_ws_once", fake_serve_ws_once)
+    monkeypatch.setattr(cli.asyncio, "sleep", fake_sleep)
+
+    try:
+        asyncio.run(
+            cli.serve_ws(
+                "http://gateway",
+                "client-1",
+                "token",
+                ThinClientSandbox(tmp_path),
+                dashboard=dashboard,
+                reconnect_policy=cli.ReconnectPolicy(initial_delay=1.0, max_delay=1.0, jitter_ratio=0.0),
+            )
+        )
+    except StopRetry:
+        pass
+    else:
+        raise NoteError("serve_ws did not enter reconnect sleep")
+
+    states = [event[0] for event in dashboard.events]
+    assert states == ["START", "CONNECTING", "ONLINE", "RECONNECTING", "STOP"]
+    assert dashboard.events[3][1]["attempt"] == 1
+    assert dashboard.events[3][1]["next_retry_seconds"] == 1.0
+    assert "InvalidMessage" in dashboard.events[3][1]["last_error"]
 
 
 def test_sandbox_blocks_parent_escape(tmp_path: Path) -> None:
@@ -168,7 +659,7 @@ def test_sandbox_blocks_parent_escape(tmp_path: Path) -> None:
     except RuntimeError as exc:
         assert "escapes" in str(exc)
     else:
-        raise AssertionError("sandbox allowed reading outside launch directory")
+        raise NoteError("sandbox allowed reading outside launch directory")
 
 
 def test_sandbox_file_tools_stay_under_root(tmp_path: Path) -> None:
@@ -211,7 +702,7 @@ def test_sandbox_run_command_rejects_cwd_escape(tmp_path: Path) -> None:
     except SandboxError as exc:
         assert "escapes" in str(exc)
     else:
-        raise AssertionError("sandbox allowed command cwd outside launch directory")
+        raise NoteError("sandbox allowed command cwd outside launch directory")
 
 
 def test_sandbox_write_file_supports_aurum_style_payloads(tmp_path: Path) -> None:
@@ -222,11 +713,17 @@ def test_sandbox_write_file_supports_aurum_style_payloads(tmp_path: Path) -> Non
     assert written["operation"] == "write"
     assert written["encoding"] == "base64"
     assert written["bytes"] == 5
+    assert written["content"] is None
+    assert written["diff"]["suppressed"] is True
+    assert written["diff"]["reason"] == "binary or non-utf8 write"
     assert sandbox.read_file("notes/a.txt")["content"] == "alpha"
 
     appended = sandbox.call("write_file", {"path": "notes/a.txt", "operation": "append", "content": "\nbeta"})
     assert appended["operation"] == "append"
     assert appended["bytes_before"] == 5
+    assert appended["diff"]["suppressed"] is False
+    assert appended["diff"]["added_lines"] == 1
+    assert appended["diff"]["hunks"][0]["lines"][-1] == {"kind": "insert", "text": "beta"}
     assert sandbox.read_file("notes/a.txt")["content"] == "alpha\nbeta"
 
     replaced = sandbox.call(
@@ -240,7 +737,10 @@ def test_sandbox_write_file_supports_aurum_style_payloads(tmp_path: Path) -> Non
         },
     )
     assert replaced["replacements"] == 1
-    assert replaced["content"] == "alpha\ngamma"
+    assert replaced["content"] is None
+    assert {"kind": "delete", "text": "beta"} in replaced["diff"]["hunks"][0]["lines"]
+    assert {"kind": "insert", "text": "gamma"} in replaced["diff"]["hunks"][0]["lines"]
+    assert sandbox.read_file("notes/a.txt")["content"] == "alpha\ngamma"
 
     regexed = sandbox.call(
         "write_file",
@@ -255,6 +755,8 @@ def test_sandbox_write_file_supports_aurum_style_payloads(tmp_path: Path) -> Non
         },
     )
     assert regexed["replacements"] == 2
+    assert regexed["diff"]["added_lines"] == 2
+    assert regexed["diff"]["removed_lines"] == 2
     assert sandbox.read_file("notes/a.txt")["content"] == "alphA\ngammA"
 
     fenced = "before\n```python\nprint('x')\n```\nafter\n```js\nconsole.log('x')\n```\n"
@@ -266,11 +768,44 @@ def test_sandbox_write_file_supports_aurum_style_payloads(tmp_path: Path) -> Non
             "operation": "remove_markdown_code_blocks",
             "language": "python",
             "expected_replacements": 1,
+            "return_content": True,
         },
     )
     assert cleaned["replacements"] == 1
     assert "print('x')" not in cleaned["content"]
     assert "console.log('x')" in cleaned["content"]
+
+
+def test_sandbox_write_file_diff_options_and_policy(tmp_path: Path, monkeypatch) -> None:
+    sandbox = ThinClientSandbox(tmp_path, max_diff_lines=2)
+    sandbox.call("write_file", {"path": "a.txt", "content": "one\ntwo\nthree", "return_content": True})
+
+    changed = sandbox.call(
+        "write_file",
+        {
+            "path": "a.txt",
+            "operation": "replace",
+            "old_text": "two",
+            "new_text": "TWO",
+            "return_content": True,
+        },
+    )
+    assert changed["content"] == "one\nTWO\nthree"
+    assert changed["diff"]["format"] == "unified"
+    assert changed["diff"]["truncated"] is True
+    assert changed["diff"]["hunks"][0]["old_start"] == 1
+
+    no_diff = sandbox.call("write_file", {"path": "b.txt", "content": "secret", "diff": False})
+    assert no_diff["diff"]["suppressed"] is True
+    assert no_diff["diff"]["reason"] == "diff disabled"
+
+    secret = sandbox.call("write_file", {"path": ".env", "content": "TOKEN=value"})
+    assert secret["diff"]["suppressed"] is True
+    assert secret["diff"]["reason"] == "path excluded by diff policy"
+
+    monkeypatch.setenv("GATEWAY_DIFF_EXCLUDE", "custom.txt")
+    custom = sandbox.call("write_file", {"path": "custom.txt", "content": "hidden"})
+    assert custom["diff"]["reason"] == "path excluded by diff policy"
 
 
 def test_sandbox_write_file_guards_overwrite_and_replacement_count(tmp_path: Path) -> None:
@@ -282,7 +817,7 @@ def test_sandbox_write_file_guards_overwrite_and_replacement_count(tmp_path: Pat
     except SandboxError as exc:
         assert "overwrite is false" in str(exc)
     else:
-        raise AssertionError("sandbox allowed overwrite=false replacement")
+        raise NoteError("sandbox allowed overwrite=false replacement")
 
     try:
         sandbox.call(
@@ -298,7 +833,7 @@ def test_sandbox_write_file_guards_overwrite_and_replacement_count(tmp_path: Pat
     except SandboxError as exc:
         assert "Expected 1 replacements, got 2" in str(exc)
     else:
-        raise AssertionError("sandbox ignored expected_replacements")
+        raise NoteError("sandbox ignored expected_replacements")
 
     assert sandbox.read_file("a.txt")["content"] == "one two two"
 
@@ -312,13 +847,13 @@ def test_browser_runtime_default_url_allowlist(tmp_path: Path) -> None:
     assert not runtime._url_allowed("file:///tmp/index.html")
 
 
-def test_browser_runtime_artifacts_stay_under_root(tmp_path: Path) -> None:
+def test_browser_runtime_files_stay_under_root(tmp_path: Path) -> None:
     runtime = ThinClientBrowserRuntime(tmp_path)
-    artifact_dir = runtime._safe_artifact_dir("../../bad/session")
+    file_dir = runtime._safe_file_dir("../../bad/session")
 
-    assert artifact_dir.exists()
-    assert artifact_dir.is_dir()
-    assert runtime.artifact_root in artifact_dir.parents
+    assert file_dir.exists()
+    assert file_dir.is_dir()
+    assert runtime.file_root in file_dir.parents
 
 
 def test_browser_runtime_accepts_safe_browser_aliases(monkeypatch, tmp_path: Path) -> None:
@@ -332,9 +867,9 @@ def test_browser_runtime_accepts_safe_browser_aliases(monkeypatch, tmp_path: Pat
         calls.append(("page_state", args))
         return {"kind": "page_state", "args": args}
 
-    async def fake_page_health(args: dict) -> dict:
-        calls.append(("page_health", args))
-        return {"kind": "page_health", "args": args}
+    async def fake_page_status(args: dict) -> dict:
+        calls.append(("page_status", args))
+        return {"kind": "page_status", "args": args}
 
     async def fake_trace_export(args: dict) -> dict:
         calls.append(("trace_export", args))
@@ -344,33 +879,33 @@ def test_browser_runtime_accepts_safe_browser_aliases(monkeypatch, tmp_path: Pat
         calls.append(("request_failures", args))
         return {"kind": "request_failures", "args": args}
 
-    async def fake_screenshot_review(args: dict) -> dict:
-        calls.append(("screenshot_review", args))
-        return {"kind": "screenshot_review", "args": args}
+    async def fake_screenshot_capture(args: dict) -> dict:
+        calls.append(("screenshot_capture", args))
+        return {"kind": "screenshot_capture", "args": args}
 
     async def fake_release_page(args: dict) -> dict:
         calls.append(("release_page", args))
         return {"kind": "release_page", "args": args}
 
     monkeypatch.setattr(runtime, "_" + word([115, 110, 97, 112, 115, 104, 111, 116]), fake_page_state)
-    monkeypatch.setattr(runtime, "_page_health", fake_page_health)
+    monkeypatch.setattr(runtime, "_page_status", fake_page_status)
     monkeypatch.setattr(runtime, "_" + word([115, 116, 111, 112, 95, 116, 114, 97, 99, 101]), fake_trace_export)
 
     monkeypatch.setattr(runtime, "_" + word([110, 101, 116, 119, 111, 114, 107]), fake_request_failures)
-    monkeypatch.setattr(runtime, "_" + word([118, 105, 115, 117, 97, 108, 95, 97, 115, 115, 101, 114, 116]), fake_screenshot_review)
+    monkeypatch.setattr(runtime, "_" + word([118, 105, 115, 117, 97, 108, 95, 97, 115, 115, 101, 114, 116]), fake_screenshot_capture)
     monkeypatch.setattr(runtime, "_close_session", fake_release_page)
 
     assert asyncio.run(runtime.call("browser_page_state", {"limit": 1}))["kind"] == "page_state"
-    assert asyncio.run(runtime.call("browser_page_health", {"limit": 2}))["kind"] == "page_health"
+    assert asyncio.run(runtime.call("browser_page_status", {"limit": 2}))["kind"] == "page_status"
     assert asyncio.run(runtime.call("browser_trace_export", {"name": "trace"}))["kind"] == "trace_export"
     assert asyncio.run(runtime.call("browser_request_failures", {"limit": 3}))["kind"] == "request_failures"
-    assert asyncio.run(runtime.call("browser_screenshot_review", {"assertion": "visible"}))["kind"] == "screenshot_review"
+    assert asyncio.run(runtime.call("browser_capture_page", {"note": "visible"}))["kind"] == "screenshot_capture"
     assert asyncio.run(runtime.call("browser_release_page", {"session_id": "abc"}))["kind"] == "release_page"
     assert calls == [
         ("page_state", {"limit": 1}),
-        ("page_health", {"limit": 2}),
+        ("page_status", {"limit": 2}),
         ("trace_export", {"name": "trace"}),
         ("request_failures", {"limit": 3}),
-        ("screenshot_review", {"assertion": "visible"}),
+        ("screenshot_capture", {"note": "visible"}),
         ("release_page", {"session_id": "abc"}),
     ]

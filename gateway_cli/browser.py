@@ -23,7 +23,7 @@ class BrowserSession:
     browser: Any
     context: Any
     page: Any
-    artifact_dir: Path
+    file_dir: Path
     browser_name: str
     viewport: dict[str, int]
     console: list[dict[str, Any]] = field(default_factory=list)
@@ -38,15 +38,15 @@ class ThinClientBrowserRuntime:
         self,
         root: str | Path,
         *,
-        artifact_root: str | Path | None = None,
+        file_root: str | Path | None = None,
         allowed_origins: list[str] | None = None,
         max_image_bytes: int | None = None,
     ) -> None:
         self.root = Path(root).resolve()
         if not self.root.exists() or not self.root.is_dir():
             raise BrowserError(f"Browser runtime root must be an existing directory: {self.root}")
-        raw_artifact_root = Path(artifact_root).expanduser() if artifact_root else self.root / ".artifacts" / "playwright"
-        self.artifact_root = raw_artifact_root.resolve() if raw_artifact_root.is_absolute() else (self.root / raw_artifact_root).resolve()
+        raw_file_root = Path(file_root).expanduser() if file_root else self.root / ".files" / "playwright"
+        self.file_root = raw_file_root.resolve() if raw_file_root.is_absolute() else (self.root / raw_file_root).resolve()
         self.allowed_origins = allowed_origins if allowed_origins is not None else self._allowed_origins_from_env()
         self.max_image_bytes = max_image_bytes if max_image_bytes is not None else int(os.environ.get("GATEWAY_BROWSER_MAX_IMAGE_BYTES", "5000000"))
         self.sessions: dict[str, BrowserSession] = {}
@@ -56,15 +56,15 @@ class ThinClientBrowserRuntime:
         values = [value.strip().rstrip("/") for value in raw.split(",") if value.strip()]
         return values or ["http://127.0.0.1:*", "http://localhost:*", "http://[::1]:*"]
 
-    def _safe_artifact_dir(self, session_id: str) -> Path:
+    def _safe_file_dir(self, session_id: str) -> Path:
         safe = re.sub(r"[^a-zA-Z0-9_.-]", "_", session_id)[:80] or uuid.uuid4().hex
-        target = (self.artifact_root / safe).resolve()
-        if self.artifact_root != target and self.artifact_root not in target.parents:
-            raise BrowserError("Artifact path escapes browser artifact root")
+        target = (self.file_root / safe).resolve()
+        if self.file_root != target and self.file_root not in target.parents:
+            raise BrowserError("File path escapes browser file root")
         target.mkdir(parents=True, exist_ok=True)
         return target
 
-    def _artifact_relative(self, path: Path) -> str:
+    def _file_relative(self, path: Path) -> str:
         try:
             return str(path.resolve().relative_to(self.root))
         except ValueError:
@@ -134,14 +134,14 @@ class ThinClientBrowserRuntime:
                     context_args["storage_state"] = str(storage_state)
             context = await browser.new_context(**context_args)
             page = await context.new_page()
-            artifact_dir = self._safe_artifact_dir(session_id)
+            file_dir = self._safe_file_dir(session_id)
             session = BrowserSession(
                 session_id=session_id,
                 playwright=playwright,
                 browser=browser,
                 context=context,
                 page=page,
-                artifact_dir=artifact_dir,
+                file_dir=file_dir,
                 browser_name=browser_name,
                 viewport={"width": width, "height": height},
             )
@@ -218,7 +218,7 @@ class ThinClientBrowserRuntime:
             "viewport": session.viewport,
             "url": session.page.url if not session.page.is_closed() else session.last_url,
             "title": title,
-            "artifact_dir": self._artifact_relative(session.artifact_dir),
+            "file_dir": self._file_relative(session.file_dir),
         }
 
     async def _goto(self, args: dict[str, Any]) -> dict[str, Any]:
@@ -305,15 +305,15 @@ class ThinClientBrowserRuntime:
         safe = re.sub(r"[^a-zA-Z0-9_.-]", "_", name).strip("._") or "screenshot"
         if not safe.endswith(".png"):
             safe = f"{safe}.png"
-        path = (session.artifact_dir / safe).resolve()
-        if session.artifact_dir != path.parent and session.artifact_dir not in path.parents:
-            raise BrowserError("Screenshot path escapes browser artifact directory")
+        path = (session.file_dir / safe).resolve()
+        if session.file_dir != path.parent and session.file_dir not in path.parents:
+            raise BrowserError("Screenshot path escapes browser file directory")
         await session.page.screenshot(path=str(path), full_page=bool(args.get("full_page", False)), type="png")
         raw = path.read_bytes()
         viewport = await session.page.evaluate("() => ({width: window.innerWidth, height: window.innerHeight, scrollWidth: document.documentElement.scrollWidth, scrollHeight: document.documentElement.scrollHeight})")
         state = await self._session_state(session)
         state["screenshot"] = {
-            "path": self._artifact_relative(path),
+            "path": self._file_relative(path),
             "mime_type": "image/png",
             "bytes": len(raw),
             "base64_attached": len(raw) <= self.max_image_bytes,
@@ -341,14 +341,14 @@ class ThinClientBrowserRuntime:
         state["error_count"] = len(entries)
         return state
 
-    async def _page_health(self, args: dict[str, Any]) -> dict[str, Any]:
+    async def _page_status(self, args: dict[str, Any]) -> dict[str, Any]:
         session = await self._get_session(args)
         app_entries = list(session.console)
         request_entries = list(session.network)
         app_errors = [entry for entry in app_entries if entry.get("type") in {"error", "pageerror"}]
         app_warnings = [entry for entry in app_entries if entry.get("type") == "warning"]
         state = await self._session_state(session)
-        artifact_path = session.artifact_dir / "page-health.json"
+        file_path = session.file_dir / "page-status.json"
         payload = {
             "session_id": session.session_id,
             "url": state.get("url"),
@@ -356,29 +356,29 @@ class ThinClientBrowserRuntime:
             "note_count": len(app_entries),
             "warning_count": len(app_warnings),
             "error_count": len(app_errors),
-            "request_failure_count": len(request_entries),
+            "failed_request_count": len(request_entries),
             "page_notes": app_entries,
             "request_failures": request_entries,
             "ts": time.time(),
         }
-        artifact_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
-        artifact = {
-            "path": self._artifact_relative(artifact_path),
-            "exists": artifact_path.exists(),
-            "bytes": artifact_path.stat().st_size if artifact_path.exists() else 0,
+        file_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+        file = {
+            "path": self._file_relative(file_path),
+            "exists": file_path.exists(),
+            "bytes": file_path.stat().st_size if file_path.exists() else 0,
         }
-        state["page_health"] = {
+        state["page_status"] = {
             "note_count": len(app_entries),
             "warning_count": len(app_warnings),
             "error_count": len(app_errors),
-            "request_failure_count": len(request_entries),
-            "artifact": artifact,
+            "failed_request_count": len(request_entries),
+            "file": file,
         }
         state["note_count"] = len(app_entries)
         state["warning_count"] = len(app_warnings)
         state["error_count"] = len(app_errors)
-        state["request_failure_count"] = len(request_entries)
-        state["diagnostics_artifact"] = artifact
+        state["failed_request_count"] = len(request_entries)
+        state["detail_file"] = file
         return state
 
     async def _start_trace(self, args: dict[str, Any]) -> dict[str, Any]:
@@ -396,50 +396,50 @@ class ThinClientBrowserRuntime:
         safe = re.sub(r"[^a-zA-Z0-9_.-]", "_", name).strip("._") or "trace.zip"
         if not safe.endswith(".zip"):
             safe = f"{safe}.zip"
-        path = (session.artifact_dir / safe).resolve()
+        path = (session.file_dir / safe).resolve()
         if session.tracing:
             await session.context.tracing.stop(path=str(path))
             session.tracing = False
         state = await self._session_state(session)
-        state["trace"] = {"path": self._artifact_relative(path), "exists": path.exists(), "bytes": path.stat().st_size if path.exists() else 0}
+        state["trace"] = {"path": self._file_relative(path), "exists": path.exists(), "bytes": path.stat().st_size if path.exists() else 0}
         state["tracing"] = False
         return state
 
     async def _visual_assert(self, args: dict[str, Any]) -> dict[str, Any]:
-        screenshot = await self._screenshot({**args, "full_page": bool(args.get("full_page", True)), "name": args.get("name") or "page-review"})
+        screenshot = await self._screenshot({**args, "full_page": bool(args.get("full_page", True)), "name": args.get("name") or "page-capture"})
         session = await self._get_session(args)
         app_entries = list(session.console)
         request_entries = list(session.network)
         app_errors = [entry for entry in app_entries if entry.get("type") in {"error", "pageerror"}]
-        verdict = "fail" if app_errors or request_entries else "needs_model_review"
-        stem = str(args.get("name") or "page-review")
-        safe_stem = re.sub(r"[^a-zA-Z0-9_.-]", "_", stem).strip("._") or "page-review"
-        diagnostics_path = session.artifact_dir / f"{safe_stem}-diagnostics.json"
-        diagnostics_payload = {
+        status = "fail" if app_errors or request_entries else "needs_model_capture"
+        stem = str(args.get("name") or "page-capture")
+        safe_stem = re.sub(r"[^a-zA-Z0-9_.-]", "_", stem).strip("._") or "page-capture"
+        details_path = session.file_dir / f"{safe_stem}-details.json"
+        details_payload = {
             "session_id": session.session_id,
-            "assertion": str(args.get("assertion") or ""),
-            "verdict": verdict,
-            "app_error_count": len(app_errors),
-            "request_failure_count": len(request_entries),
+            "note": str(args.get("note") or args.get("assertion") or ""),
+            "status": status,
+            "issue_count": len(app_errors),
+            "failed_request_count": len(request_entries),
             "page_notes": app_entries,
             "request_failures": request_entries,
             "ts": time.time(),
         }
-        diagnostics_path.write_text(json.dumps(diagnostics_payload, ensure_ascii=False, indent=2), encoding="utf-8")
-        screenshot["assertion"] = str(args.get("assertion") or "")
-        screenshot["verdict"] = verdict
-        screenshot["app_error_count"] = len(app_errors)
-        screenshot["request_failure_count"] = len(request_entries)
-        screenshot["diagnostics_artifact"] = {
-            "path": self._artifact_relative(diagnostics_path),
-            "exists": diagnostics_path.exists(),
-            "bytes": diagnostics_path.stat().st_size if diagnostics_path.exists() else 0,
+        details_path.write_text(json.dumps(details_payload, ensure_ascii=False, indent=2), encoding="utf-8")
+        screenshot["note"] = str(args.get("note") or args.get("assertion") or "")
+        screenshot["status"] = status
+        screenshot["issue_count"] = len(app_errors)
+        screenshot["failed_request_count"] = len(request_entries)
+        screenshot["detail_file"] = {
+            "path": self._file_relative(details_path),
+            "exists": details_path.exists(),
+            "bytes": details_path.stat().st_size if details_path.exists() else 0,
         }
-        screenshot["review"] = {
-            "assertion": screenshot["assertion"],
-            "verdict": verdict,
-            "app_error_count": len(app_errors),
-            "request_failure_count": len(request_entries),
+        screenshot["capture"] = {
+            "note": screenshot["note"],
+            "status": status,
+            "issue_count": len(app_errors),
+            "failed_request_count": len(request_entries),
         }
         return screenshot
 
@@ -478,10 +478,10 @@ class ThinClientBrowserRuntime:
             return await self._snapshot(args)
         if tool == "browser_page_state":
             return await self._snapshot(args)
-        if tool == "browser_page_health":
-            return await self._page_health(args)
+        if tool == "browser_page_status":
+            return await self._page_status(args)
         if tool == "browser_client_messages":
-            return await self._page_health(args)
+            return await self._page_status(args)
         if tool == "browser_app_events":
             state = await self._console(args)
             entries = state.pop("console", [])
@@ -494,7 +494,7 @@ class ThinClientBrowserRuntime:
             state["request_failures"] = entries
             state["failure_count"] = len(entries)
             return state
-        if tool == "browser_screenshot_review":
+        if tool == "browser_capture_page":
             return await self._visual_assert(args)
         if tool == "browser_click":
             return await self._click(args)

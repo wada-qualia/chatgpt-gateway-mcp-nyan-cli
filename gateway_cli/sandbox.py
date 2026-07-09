@@ -2,6 +2,9 @@ from __future__ import annotations
 
 import base64
 import binascii
+import difflib
+import fnmatch
+import os
 import re
 import subprocess
 from pathlib import Path
@@ -20,6 +23,7 @@ class ThinClientSandbox:
         max_read_bytes: int = 200_000,
         max_write_bytes: int = 1_000_000,
         max_output_chars: int = 30_000,
+        max_diff_lines: int = 300,
     ) -> None:
         self.root = Path(root).resolve()
         if not self.root.exists() or not self.root.is_dir():
@@ -27,6 +31,7 @@ class ThinClientSandbox:
         self.max_read_bytes = max_read_bytes
         self.max_write_bytes = max_write_bytes
         self.max_output_chars = max_output_chars
+        self.max_diff_lines = max_diff_lines
 
     def safe_path(self, relative: str | None = ".") -> Path:
         value = relative or "."
@@ -95,7 +100,10 @@ class ThinClientSandbox:
             args["content"] = content
         operation = str(args.get("operation") or "write")
         target = self.safe_path(path)
+        relative_path = self.relative(target)
         bytes_before = target.stat().st_size if target.exists() and target.is_file() else 0
+        return_content = bool(args.get("return_content", False))
+        include_diff = bool(args.get("diff", True))
 
         if operation in {"write", "append"}:
             raw, encoding = self.decode_write_content(args)
@@ -105,17 +113,24 @@ class ThinClientSandbox:
                 raise SandboxError("File already exists and overwrite is false")
             if operation == "append" and "content_base64" in args:
                 raise SandboxError("append supports UTF-8 content only")
-            final = (target.read_bytes() if operation == "append" and target.exists() else b"") + raw
+            original_raw = target.read_bytes() if operation == "append" and target.exists() else b""
+            final = original_raw + raw
+            diff_payload = self.build_write_diff(relative_path, original_raw, final, encoding=encoding, include_diff=include_diff)
             self.write_bytes(target, final, mode=args.get("mode"))
-            return {
-                "path": self.relative(target),
+            result = {
+                "path": relative_path,
                 "operation": operation,
                 "bytes": len(raw),
                 "bytes_before": bytes_before,
                 "bytes_after": len(final),
                 "encoding": encoding,
                 "replacements": 0,
+                "content": None,
+                "diff": diff_payload,
             }
+            if return_content and encoding == "utf-8":
+                result["content"] = final.decode("utf-8", errors="replace")
+            return result
 
         if operation in {"replace", "regex_replace", "remove_markdown_code_blocks"}:
             original = self.read_text_for_edit(target)
@@ -126,19 +141,112 @@ class ThinClientSandbox:
             if replacements <= 0 and operation != "remove_markdown_code_blocks":
                 raise SandboxError(f"No text matched operation {operation!r}")
             raw = edited.encode("utf-8")
+            diff_payload = self.build_text_diff(relative_path, original, edited, include_diff=include_diff)
             self.write_bytes(target, raw, mode=args.get("mode"))
             return {
-                "path": self.relative(target),
+                "path": relative_path,
                 "operation": operation,
                 "bytes": len(raw),
                 "bytes_before": len(original.encode("utf-8")),
                 "bytes_after": len(raw),
                 "encoding": "utf-8",
                 "replacements": replacements,
-                "content": edited,
+                "content": edited if return_content else None,
+                "diff": diff_payload,
             }
 
         raise SandboxError("operation must be write, append, replace, regex_replace, or remove_markdown_code_blocks")
+
+    def build_write_diff(self, relative_path: str, original_raw: bytes, final_raw: bytes, *, encoding: str | None, include_diff: bool) -> dict[str, Any]:
+        if not include_diff:
+            return {"format": "unified", "suppressed": True, "reason": "diff disabled", "truncated": False, "added_lines": 0, "removed_lines": 0, "hunks": []}
+        if self.diff_path_excluded(relative_path):
+            return {"format": "unified", "suppressed": True, "reason": "path excluded by diff policy", "truncated": False, "added_lines": 0, "removed_lines": 0, "hunks": []}
+        if encoding != "utf-8":
+            return {"format": "unified", "suppressed": True, "reason": "binary or non-utf8 write", "truncated": False, "added_lines": 0, "removed_lines": 0, "hunks": []}
+        if len(original_raw) > self.max_read_bytes or len(final_raw) > self.max_write_bytes:
+            return {"format": "unified", "suppressed": True, "reason": "file too large for inline diff", "truncated": False, "added_lines": 0, "removed_lines": 0, "hunks": []}
+        try:
+            original = original_raw.decode("utf-8")
+            final = final_raw.decode("utf-8")
+        except UnicodeDecodeError:
+            return {"format": "unified", "suppressed": True, "reason": "content is not utf-8", "truncated": False, "added_lines": 0, "removed_lines": 0, "hunks": []}
+        return self.build_text_diff(relative_path, original, final, include_diff=True)
+
+    def build_text_diff(self, relative_path: str, original: str, edited: str, *, include_diff: bool) -> dict[str, Any]:
+        if not include_diff:
+            return {"format": "unified", "suppressed": True, "reason": "diff disabled", "truncated": False, "added_lines": 0, "removed_lines": 0, "hunks": []}
+        if self.diff_path_excluded(relative_path):
+            return {"format": "unified", "suppressed": True, "reason": "path excluded by diff policy", "truncated": False, "added_lines": 0, "removed_lines": 0, "hunks": []}
+        old_lines = original.splitlines()
+        new_lines = edited.splitlines()
+        matcher = difflib.SequenceMatcher(None, old_lines, new_lines)
+        hunks = []
+        emitted_lines = 0
+        truncated = False
+        added_lines = 0
+        removed_lines = 0
+        for group in matcher.get_grouped_opcodes(n=3):
+            first = group[0]
+            last = group[-1]
+            old_start = first[1] + 1
+            new_start = first[3] + 1
+            old_count = last[2] - first[1]
+            new_count = last[4] - first[3]
+            hunk_lines = []
+            for tag, i1, i2, j1, j2 in group:
+                if tag == "equal":
+                    for line in old_lines[i1:i2]:
+                        if emitted_lines >= self.max_diff_lines:
+                            truncated = True
+                            break
+                        hunk_lines.append({"kind": "context", "text": line})
+                        emitted_lines += 1
+                elif tag == "delete":
+                    for line in old_lines[i1:i2]:
+                        if emitted_lines >= self.max_diff_lines:
+                            truncated = True
+                            break
+                        hunk_lines.append({"kind": "delete", "text": line})
+                        emitted_lines += 1
+                        removed_lines += 1
+                elif tag == "insert":
+                    for line in new_lines[j1:j2]:
+                        if emitted_lines >= self.max_diff_lines:
+                            truncated = True
+                            break
+                        hunk_lines.append({"kind": "insert", "text": line})
+                        emitted_lines += 1
+                        added_lines += 1
+                elif tag == "replace":
+                    for line in old_lines[i1:i2]:
+                        if emitted_lines >= self.max_diff_lines:
+                            truncated = True
+                            break
+                        hunk_lines.append({"kind": "delete", "text": line})
+                        emitted_lines += 1
+                        removed_lines += 1
+                    if not truncated:
+                        for line in new_lines[j1:j2]:
+                            if emitted_lines >= self.max_diff_lines:
+                                truncated = True
+                                break
+                            hunk_lines.append({"kind": "insert", "text": line})
+                            emitted_lines += 1
+                            added_lines += 1
+                if truncated:
+                    break
+            hunks.append({"old_start": old_start, "old_count": old_count, "new_start": new_start, "new_count": new_count, "lines": hunk_lines})
+            if truncated:
+                break
+        return {"format": "unified", "suppressed": False, "truncated": truncated, "added_lines": added_lines, "removed_lines": removed_lines, "hunks": hunks}
+
+    def diff_path_excluded(self, relative_path: str) -> bool:
+        patterns = [".env", ".env.*", "*.pem", "*.key", "id_rsa", "id_ed25519", "**/.ssh/**", ".ssh/**"]
+        raw = os.environ.get("GATEWAY_DIFF_EXCLUDE")
+        if raw:
+            patterns.extend(item.strip() for item in raw.split(",") if item.strip())
+        return any(fnmatch.fnmatch(relative_path, pattern) for pattern in patterns)
 
     def write_bytes(self, target: Path, raw: bytes, *, mode: Any = None) -> None:
         if len(raw) > self.max_write_bytes:
