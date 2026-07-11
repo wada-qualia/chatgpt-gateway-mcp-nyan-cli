@@ -26,6 +26,7 @@ WEBSOCKET_RECONNECT_SECONDS = 1.0
 WEBSOCKET_RECONNECT_FACTOR = 1.6
 WEBSOCKET_RECONNECT_JITTER_RATIO = 0.2
 TERMINAL_WEBSOCKET_CLOSE_CODES = {4401, 4404}
+DASHBOARD_EVENT_CACHE_SIZE = 64
 
 
 @dataclass(frozen=True)
@@ -126,7 +127,9 @@ class TerminalDashboardConfig:
     directory: Path
     gateway: str
     hostname: str
+    history_path: Path | None = None
     no_color: bool = False
+    persist_history: bool = True
     use_tui: bool = False
 
 
@@ -136,6 +139,9 @@ class TerminalDashboardState:
     recent_events: list[dict] = field(default_factory=list)
     attempt: int = 0
     connection_state: str = "INITIALIZING"
+    event_count: int = 0
+    history_error: str | None = None
+    history_path: str | None = None
     last_error: str | None = None
     last_online_at: float | None = None
     next_retry_seconds: float | None = None
@@ -230,30 +236,52 @@ class TerminalDashboardRenderer:
         self.config = config
         self.stream = stream or sys.stderr
         self.state = TerminalDashboardState()
-        self._live = None
         self._console = None
+        self._history_handle = None
         self._last_plain_line: str | None = None
+        self._live = None
         self._rich_available = False
+        self._started = False
+        self._tui_active = False
 
     def start(self) -> None:
+        if self._started:
+            return
+        self._started = True
+        self._open_history()
         if not self.config.use_tui:
             self._print_plain("INITIALIZING")
+            self._print_plain_history_path()
             return
         try:
             from rich.console import Console
             from rich.live import Live
         except ImportError:
             self._print_plain("INITIALIZING")
+            self._print_plain_history_path()
             return
         self._rich_available = True
+        self._tui_active = True
         self._console = Console(file=self.stream, no_color=self.config.no_color)
-        self._live = Live(self._render_rich(), console=self._console, refresh_per_second=4, transient=False)
+        self._console.print(self._render_rich_history_header())
+        for event in self.state.recent_events:
+            self._console.print(self._render_rich_event(event))
+        self._live = Live(
+            self._render_rich(),
+            console=self._console,
+            auto_refresh=False,
+            transient=False,
+            vertical_overflow="visible",
+        )
         self._live.start()
 
     def stop(self) -> None:
         if self._live is not None:
             self._live.stop()
             self._live = None
+        self._close_history()
+        self._started = False
+        self._tui_active = False
 
     def update(
         self,
@@ -273,27 +301,109 @@ class TerminalDashboardRenderer:
         if connection_state == "ONLINE":
             self.state.last_online_at = time.time()
         if self._live is not None:
-            self._live.update(self._render_rich())
-        else:
+            self._live.update(self._render_rich(), refresh=True)
+        elif self._started:
             self._print_plain(connection_state)
 
     def record_event(self, kind: str, title: str, detail: str = "", status: str = "info", payload: dict | None = None) -> None:
+        self.state.event_count += 1
         event = {
             "detail": truncate_dashboard_text(detail, 180),
             "kind": kind,
             "payload": payload or {},
+            "sequence": self.state.event_count,
             "status": status,
             "time": time.strftime("%H:%M:%S"),
+            "timestamp": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
             "title": truncate_dashboard_text(title, 80),
         }
         self.state.recent_events.append(event)
-        self.state.recent_events = self.state.recent_events[-12:]
+        self.state.recent_events = self.state.recent_events[-DASHBOARD_EVENT_CACHE_SIZE:]
         self.state.active_sessions = monitored_process_snapshots()
-        if self._live is not None:
-            self._live.update(self._render_rich())
-        else:
+        self._write_history_record({"type": "event", **event})
+        if self._tui_active and self._console is not None:
+            self._console.print(self._render_rich_event(event))
+            if self._live is not None:
+                self._live.update(self._render_rich(), refresh=True)
+        elif self._started:
             detail_suffix = f" {event['detail']}" if event["detail"] else ""
             print(f"gateway-cli: event={event['kind']} status={event['status']} {event['title']}{detail_suffix}", file=self.stream)
+
+    def _default_history_path(self) -> Path:
+        session_root = Path(os.environ.get("GATEWAY_THIN_CLIENT_HOME", Path.home() / ".local/share/gateway-thin-client")).expanduser()
+        identity = f"{self.config.gateway.rstrip('/')}\0{self.config.client_id}\0{self.config.directory.resolve()}"
+        identity_hash = hashlib.sha256(identity.encode("utf-8")).hexdigest()[:16]
+        stamp = time.strftime("%Y%m%d-%H%M%S")
+        nonce = f"{os.getpid()}-{time.time_ns() & 0xFFFFFF:06x}"
+        return session_root / "history" / identity_hash / f"{stamp}-{nonce}.jsonl"
+
+    def _open_history(self) -> None:
+        if not self.config.persist_history:
+            return
+        managed_history_path = self.config.history_path is None
+        history_path = self.config.history_path.expanduser() if self.config.history_path is not None else self._default_history_path()
+        if not history_path.is_absolute():
+            history_path = Path.cwd() / history_path
+        self.state.history_path = str(history_path)
+        try:
+            history_path.parent.mkdir(parents=True, exist_ok=True)
+            if managed_history_path:
+                try:
+                    history_path.parent.chmod(0o700)
+                except OSError:
+                    pass
+            self._history_handle = history_path.open("a", encoding="utf-8", buffering=1)
+            try:
+                history_path.chmod(0o600)
+            except OSError:
+                pass
+        except OSError as exc:
+            self.state.history_error = compact_exception_message(exc)
+            self._history_handle = None
+            return
+        self._write_history_record(
+            {
+                "type": "session_start",
+                "timestamp": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+                "client_id": self.config.client_id,
+                "directory": str(self.config.directory),
+                "gateway": self.config.gateway,
+                "hostname": self.config.hostname,
+                "pid": os.getpid(),
+                "version": __version__,
+            }
+        )
+
+    def _close_history(self) -> None:
+        if self._history_handle is None:
+            return
+        self._write_history_record(
+            {
+                "type": "session_end",
+                "timestamp": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+                "event_count": self.state.event_count,
+            }
+        )
+        try:
+            self._history_handle.close()
+        except OSError as exc:
+            self.state.history_error = compact_exception_message(exc)
+        finally:
+            self._history_handle = None
+
+    def _write_history_record(self, record: dict) -> None:
+        if self._history_handle is None:
+            return
+        try:
+            self._history_handle.write(json.dumps(record, ensure_ascii=False, default=str, separators=(",", ":")) + "\n")
+        except (OSError, TypeError, ValueError) as exc:
+            self.state.history_error = compact_exception_message(exc)
+
+    def _print_plain_history_path(self) -> None:
+        if self.state.history_path:
+            print(f"gateway-cli: session_history={self.state.history_path}", file=self.stream)
+        elif self.state.history_error:
+            print(f"gateway-cli: session_history_error={self.state.history_error}", file=self.stream)
 
     def _print_plain(self, connection_state: str) -> None:
         suffix = ""
@@ -304,19 +414,26 @@ class TerminalDashboardRenderer:
             if self.state.last_error:
                 suffix += f" last_error={self.state.last_error}"
         elif connection_state == "ONLINE":
-            suffix = f" active_commands={len(self.state.active_sessions)}"
+            suffix = f" active_commands={len(self.state.active_sessions)} events={self.state.event_count}"
         line = f"gateway-cli: state={connection_state}{suffix}"
         if line != self._last_plain_line:
             print(line, file=self.stream)
             self._last_plain_line = line
 
     def _render_rich(self):
-        from rich.table import Table
+        return self._render_rich_bottom_bar()
 
-        root = Table.grid(expand=True)
-        root.add_row(self._render_rich_activity())
-        root.add_row(self._render_rich_bottom_bar())
-        return root
+    def _render_rich_history_header(self):
+        from rich.text import Text
+
+        header = Text()
+        header.append("Session activity", style="bold")
+        header.append(" — append-only terminal scrollback; newest events appear at the bottom", style="dim")
+        if self.state.history_path:
+            header.append(f"\nPersistent JSONL: {self.state.history_path}", style="dim")
+        elif self.state.history_error:
+            header.append(f"\nHistory persistence unavailable: {self.state.history_error}", style="yellow")
+        return header
 
     def _render_rich_bottom_bar(self):
         from rich import box
@@ -332,6 +449,11 @@ class TerminalDashboardRenderer:
         summary.add_row("Gateway", self.config.gateway)
         summary.add_row("Directory", str(self.config.directory))
         summary.add_row("State", self.state.connection_state)
+        summary.add_row("Events", str(self.state.event_count))
+        if self.state.history_path:
+            summary.add_row("History", truncate_dashboard_text(self.state.history_path, 96))
+        if self.state.history_error:
+            summary.add_row("History error", Text(truncate_dashboard_text(self.state.history_error, 120), style="yellow"))
         if self.state.connection_state == "RECONNECTING":
             summary.add_row("Attempt", str(self.state.attempt))
             if self.state.next_retry_seconds is not None:
@@ -371,23 +493,27 @@ class TerminalDashboardRenderer:
         from rich.panel import Panel
         from rich.text import Text
 
-        rows = [Text("Event history — older events above, newest events at the bottom", style="italic")]
+        rows = [Text("Cached activity snapshot — complete history remains in terminal scrollback and JSONL", style="italic")]
         if not self.state.recent_events:
             rows.append(Panel(Text("No tool activity yet", style="dim"), border_style="dim"))
             return Group(*rows)
-        for event in self.state.recent_events[-10:]:
-            if event.get("kind") == "file" and isinstance(event.get("payload"), dict):
-                rows.append(self._render_rich_file_event(event))
-            else:
-                title = Text()
-                title.append("● ", style=self._event_dot_style(str(event.get("status", "info"))))
-                title.append(f"{event.get('title', '')}", style="bold")
-                title.append(f"  {event.get('time', '')}", style="dim")
-                detail = str(event.get("detail") or "")
-                if detail:
-                    title.append(f"\n  ⎿  {detail}", style="dim")
-                rows.append(Panel(title, border_style="dim", padding=(0, 1)))
+        rows.extend(self._render_rich_event(event) for event in self.state.recent_events)
         return Group(*rows)
+
+    def _render_rich_event(self, event: dict):
+        from rich.panel import Panel
+        from rich.text import Text
+
+        if event.get("kind") == "file" and isinstance(event.get("payload"), dict):
+            return self._render_rich_file_event(event)
+        title = Text()
+        title.append("● ", style=self._event_dot_style(str(event.get("status", "info"))))
+        title.append(f"{event.get('title', '')}", style="bold")
+        title.append(f"  {event.get('time', '')}", style="dim")
+        detail = str(event.get("detail") or "")
+        if detail:
+            title.append(f"\n  ⎿  {detail}", style="dim")
+        return Panel(title, border_style="dim", padding=(0, 1))
 
     def _render_rich_file_event(self, event: dict):
         from rich.table import Table
@@ -423,7 +549,7 @@ class TerminalDashboardRenderer:
             new_line = int(hunk.get("new_start", 1) or 1)
             for line in list(hunk.get("lines") or [])[:18]:
                 kind = str(line.get("kind", "context"))
-                text = str(line.get("text", ""))
+                value = str(line.get("text", ""))
                 if kind == "insert":
                     number = new_line
                     new_line += 1
@@ -434,7 +560,7 @@ class TerminalDashboardRenderer:
                     number = old_line
                     old_line += 1
                     new_line += 1
-                card.add_row(self._render_rich_diff_line(number, kind, text))
+                card.add_row(self._render_rich_diff_line(number, kind, value))
                 rendered += 1
                 if rendered >= 42:
                     card.add_row(Text("     … diff truncated in terminal view", style="yellow"))
@@ -470,13 +596,16 @@ def stderr_supports_tui() -> bool:
 
 
 def terminal_dashboard_from_args(gateway: str, client_id: str, directory: Path, args: argparse.Namespace) -> TerminalDashboardRenderer:
+    history_path = Path(args.history_file).expanduser() if args.history_file else None
     return TerminalDashboardRenderer(
         TerminalDashboardConfig(
             client_id=client_id,
             directory=directory,
             gateway=gateway,
             hostname=socket.gethostname(),
+            history_path=history_path,
             no_color=bool(args.no_color),
+            persist_history=not bool(args.no_history_file),
             use_tui=bool(not args.no_tui and not args.plain_output and stderr_supports_tui()),
         )
     )
@@ -1125,6 +1254,9 @@ def build_parser() -> argparse.ArgumentParser:
     login_parser.add_argument("--no-tui", action="store_true")
     login_parser.add_argument("--plain-output", action="store_true")
     login_parser.add_argument("--no-color", action="store_true")
+    history_group = login_parser.add_mutually_exclusive_group()
+    history_group.add_argument("--history-file", help="Append the complete session activity stream to this JSONL file.")
+    history_group.add_argument("--no-history-file", action="store_true", help="Disable persistent JSONL session history.")
     login_parser.add_argument("--no-reconnect-jitter", action="store_true")
     login_parser.add_argument("--debug", action="store_true", help="Print retryable WebSocket tracebacks while serving.")
     login_parser.add_argument("--force-auth", action="store_true", help="Ignore saved session and authorize again.")

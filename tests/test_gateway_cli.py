@@ -476,6 +476,7 @@ def test_terminal_dashboard_plain_mode_prints_compact_state(tmp_path: Path) -> N
             directory=tmp_path,
             gateway="http://gateway",
             hostname="host",
+            persist_history=False,
             use_tui=False,
         ),
         stream=stream,
@@ -490,17 +491,19 @@ def test_terminal_dashboard_plain_mode_prints_compact_state(tmp_path: Path) -> N
     output = stream.getvalue()
     assert "gateway-cli: state=INITIALIZING" in output
     assert "gateway-cli: state=CONNECTING" in output
-    assert "gateway-cli: state=ONLINE active_commands=0" in output
+    assert "gateway-cli: state=ONLINE active_commands=0 events=0" in output
     assert "gateway-cli: state=RECONNECTING attempt=2 next_retry=3.5s last_error=InvalidMessage: bad response" in output
 
 
-def test_terminal_dashboard_records_recent_activity_in_plain_mode(tmp_path: Path) -> None:
+def test_terminal_dashboard_persists_complete_activity_history(tmp_path: Path) -> None:
     stream = io.StringIO()
+    history_path = tmp_path / "activity.jsonl"
     renderer = cli.TerminalDashboardRenderer(
         cli.TerminalDashboardConfig(
             client_id="client-1",
             directory=tmp_path,
             gateway="http://gateway",
+            history_path=history_path,
             hostname="host",
             use_tui=False,
         ),
@@ -513,10 +516,16 @@ def test_terminal_dashboard_records_recent_activity_in_plain_mode(tmp_path: Path
     renderer.stop()
 
     output = stream.getvalue()
+    assert f"gateway-cli: session_history={history_path}" in output
     assert "gateway-cli: event=file status=success file edited replace docs/policy.md +1 -1" in output
     assert "gateway-cli: event=command status=success command completed exit=0 cwd=. pytest -q" in output
     assert [event["kind"] for event in renderer.state.recent_events] == ["file", "command"]
-    assert renderer.state.recent_events[-1]["title"] == "command completed"
+    assert renderer.state.event_count == 2
+
+    records = [json.loads(line) for line in history_path.read_text(encoding="utf-8").splitlines()]
+    assert [record["type"] for record in records] == ["session_start", "event", "event", "session_end"]
+    assert [record.get("sequence") for record in records if record["type"] == "event"] == [1, 2]
+    assert records[-1]["event_count"] == 2
 
 
 def test_terminal_dashboard_rich_layout_keeps_status_in_bottom_bar(tmp_path: Path) -> None:
@@ -530,6 +539,7 @@ def test_terminal_dashboard_rich_layout_keeps_status_in_bottom_bar(tmp_path: Pat
             directory=tmp_path,
             gateway="http://gateway",
             hostname="host",
+            persist_history=False,
             use_tui=True,
         ),
         stream=io.StringIO(),
@@ -548,20 +558,22 @@ def test_terminal_dashboard_rich_layout_keeps_status_in_bottom_bar(tmp_path: Pat
         }
     ]
 
+    console.print(renderer._render_rich_activity())
     console.print(renderer._render_rich())
     rendered = stream.getvalue()
 
-    assert "Event history" in rendered
+    assert "Cached activity snapshot" in rendered
     assert "Thin client bottom bar" in rendered
     assert "Client info" in rendered
     assert "Active monitored commands" in rendered
-    assert rendered.index("Event history") < rendered.index("Thin client bottom bar")
     assert rendered.index("first event") < rendered.index("latest event")
     assert rendered.index("latest event") < rendered.index("Client info")
     assert "session-1" in rendered
+    assert "Events" in rendered
+    assert "2" in rendered
 
 
-def test_terminal_dashboard_rich_activity_keeps_newest_events_at_bottom(tmp_path: Path) -> None:
+def test_terminal_dashboard_bounds_memory_cache_without_losing_event_count(tmp_path: Path) -> None:
     from rich.console import Console
 
     stream = io.StringIO()
@@ -572,21 +584,26 @@ def test_terminal_dashboard_rich_activity_keeps_newest_events_at_bottom(tmp_path
             directory=tmp_path,
             gateway="http://gateway",
             hostname="host",
+            persist_history=False,
             use_tui=True,
         ),
         stream=io.StringIO(),
     )
-    for index in range(12):
+    for index in range(70):
         renderer.record_event("tool", f"event {index:02d}", "", "success")
 
     console.print(renderer._render_rich_activity())
     rendered = stream.getvalue()
 
+    assert renderer.state.event_count == 70
+    assert len(renderer.state.recent_events) == cli.DASHBOARD_EVENT_CACHE_SIZE
+    assert renderer.state.recent_events[0]["title"] == "event 06"
+    assert renderer.state.recent_events[-1]["title"] == "event 69"
     assert "event 00" not in rendered
-    assert "event 01" not in rendered
-    assert "event 02" in rendered
-    assert "event 11" in rendered
-    assert rendered.index("event 02") < rendered.index("event 11")
+    assert "event 05" not in rendered
+    assert "event 06" in rendered
+    assert "event 69" in rendered
+    assert rendered.index("event 06") < rendered.index("event 69")
 
 
 def test_serve_ws_updates_dashboard_states(monkeypatch, tmp_path: Path) -> None:
