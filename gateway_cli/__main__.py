@@ -13,7 +13,7 @@ import time
 import traceback
 from dataclasses import dataclass, field
 from pathlib import Path
-from urllib.error import HTTPError
+from urllib.error import HTTPError, URLError
 from urllib.parse import urljoin, urlencode
 from urllib.request import Request, urlopen
 
@@ -623,7 +623,9 @@ def request_json(method: str, url: str, payload: dict | None = None, token: str 
         return json.loads(response.read().decode("utf-8"))
 
 
-def http_error_message(exc: HTTPError) -> str:
+def http_error_message(exc: HTTPError | URLError) -> str:
+    if isinstance(exc, URLError) and not isinstance(exc, HTTPError):
+        return str(exc.reason)
     body = exc.read().decode("utf-8", errors="replace")
     if body:
         try:
@@ -1175,7 +1177,7 @@ def login(args: argparse.Namespace) -> int:
     else:
         try:
             device = request_json("POST", urljoin(gateway, "/api/thin-clients/device-code"))
-        except HTTPError as exc:
+        except (HTTPError, URLError) as exc:
             print(f"gateway-cli login: device-code request failed: {http_error_message(exc)}", file=sys.stderr)
             return 1
         device_code = str(device["device_code"])
@@ -1191,7 +1193,7 @@ def login(args: argparse.Namespace) -> int:
         print("Waiting for thin-client device-code authorization")
     try:
         token = poll_token(gateway, device_code, interval)
-    except HTTPError as exc:
+    except (HTTPError, URLError) as exc:
         print(f"gateway-cli login: device-code authorization failed: {http_error_message(exc)}", file=sys.stderr)
         return 1
     register_payload = {
@@ -1201,7 +1203,7 @@ def login(args: argparse.Namespace) -> int:
     }
     try:
         client = request_json("POST", urljoin(gateway, "/api/thin-clients/register"), register_payload, token=token)
-    except HTTPError as exc:
+    except (HTTPError, URLError) as exc:
         print(f"gateway-cli login: registration failed: {http_error_message(exc)}", file=sys.stderr)
         return 1
     save_session(gateway, root, client=client, token=token)

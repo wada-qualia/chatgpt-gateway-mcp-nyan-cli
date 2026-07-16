@@ -9,7 +9,7 @@ from pathlib import Path
 import sys
 import time
 import types
-from urllib.error import HTTPError
+from urllib.error import HTTPError, URLError
 
 from gateway_cli import __main__ as cli
 from gateway_cli.browser import ThinClientBrowserRuntime
@@ -125,6 +125,24 @@ def test_login_reports_device_code_http_error_without_traceback(monkeypatch, tmp
 
     captured = capsys.readouterr()
     assert "Invalid device_code" in captured.err
+    assert "Traceback" not in captured.err
+
+
+def test_login_reports_device_code_connection_error_without_traceback(monkeypatch, tmp_path: Path, capsys) -> None:
+    monkeypatch.setenv("GATEWAY_THIN_CLIENT_HOME", str(tmp_path / ".client-home"))
+
+    def fake_request_json(method: str, url: str, payload: dict | None = None, token: str | None = None) -> dict:
+        if url.endswith("/api/thin-clients/token"):
+            raise URLError(ConnectionRefusedError(61, "Connection refused"))
+        raise NoteError(url)
+
+    monkeypatch.setattr(cli, "request_json", fake_request_json)
+
+    assert cli.main(["login", "--gateway", "http://gateway", "--directory", str(tmp_path), "--device-code", "code"]) == 1
+
+    captured = capsys.readouterr()
+    assert "device-code authorization failed" in captured.err
+    assert "Connection refused" in captured.err
     assert "Traceback" not in captured.err
 
 
