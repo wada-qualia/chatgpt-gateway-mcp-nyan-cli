@@ -27,6 +27,12 @@ WEBSOCKET_RECONNECT_FACTOR = 1.6
 WEBSOCKET_RECONNECT_JITTER_RATIO = 0.2
 TERMINAL_WEBSOCKET_CLOSE_CODES = {4401, 4404}
 DASHBOARD_EVENT_CACHE_SIZE = 64
+DEFAULT_GATEWAY_URL = "http://localhost:8000"
+
+
+def default_gateway_url() -> str:
+    value = os.environ.get("GATEWAY_URL", DEFAULT_GATEWAY_URL).strip().rstrip("/")
+    return value or DEFAULT_GATEWAY_URL
 
 
 @dataclass(frozen=True)
@@ -119,6 +125,18 @@ def compact_exception_message(exc: BaseException) -> str:
     if not message:
         message = exc.__class__.__name__
     return f"{exc.__class__.__name__}: {message}"
+
+
+async def send_json_if_connected(send_json, payload: dict, websockets_module: object) -> bool:
+    try:
+        await send_json(payload)
+    except asyncio.CancelledError:
+        raise
+    except Exception as exc:
+        if is_retryable_websocket_error(exc, websockets_module):
+            return False
+        raise
+    return True
 
 
 @dataclass(frozen=True)
@@ -864,10 +882,39 @@ async def serve_ws_once(
             on_connected()
         send_lock = asyncio.Lock()
         browser_runtime = ThinClientBrowserRuntime(sandbox.root)
+        background_tasks: set[asyncio.Task] = set()
+        transport_available = True
+
+        def spawn_background_task(coro) -> asyncio.Task:
+            task = asyncio.create_task(coro)
+            background_tasks.add(task)
+
+            def finish_background_task(completed_task: asyncio.Task) -> None:
+                background_tasks.discard(completed_task)
+                if completed_task.cancelled():
+                    return
+                try:
+                    exc = completed_task.exception()
+                except asyncio.CancelledError:
+                    return
+                if exc is not None:
+                    record_dashboard_event("client", "background task failed", compact_exception_message(exc), "failed")
+
+            task.add_done_callback(finish_background_task)
+            return task
 
         async def send_json(payload: dict) -> None:
             async with send_lock:
                 await websocket.send(json.dumps(payload))
+
+        async def send_json_best_effort(payload: dict) -> bool:
+            nonlocal transport_available
+            if not transport_available:
+                return False
+            sent = await send_json_if_connected(send_json, payload, websockets)
+            if not sent:
+                transport_available = False
+            return sent
 
         def record_dashboard_event(kind: str, title: str, detail: str = "", status: str = "info", payload: dict | None = None) -> None:
             if on_dashboard_event is not None:
@@ -904,7 +951,7 @@ async def serve_ws_once(
                 raw = await reader.readline()
                 if not raw:
                     break
-                await send_json(
+                await send_json_best_effort(
                     {
                         "type": "session_output",
                         "session_id": session_id,
@@ -918,7 +965,9 @@ async def serve_ws_once(
             command = str(arguments.get("command", "")).strip()
             cwd = str(arguments.get("cwd", "."))
             if not session_id or not command:
-                await send_json({"type": "tool_result", "request_id": request_id, "ok": False, "error": "session_id and command are required"})
+                await send_json_best_effort(
+                    {"type": "tool_result", "request_id": request_id, "ok": False, "error": "session_id and command are required"}
+                )
                 return
             try:
                 working_dir = sandbox.safe_path(cwd)
@@ -930,7 +979,7 @@ async def serve_ws_once(
                 )
                 LOCAL_COMMAND_REGISTRY.register(session_id, process, command=command, cwd=cwd)
                 record_dashboard_event("command", "monitored command started", f"{session_id} pid={process.pid} cwd={cwd} {truncate_dashboard_text(command, 90)}", "running")
-                await send_json(
+                await send_json_best_effort(
                     {
                         "type": "tool_result",
                         "request_id": request_id,
@@ -944,7 +993,7 @@ async def serve_ws_once(
                 )
                 exit_code = await process.wait()
                 status = "completed" if exit_code == 0 else "failed"
-                await send_json(
+                await send_json_best_effort(
                     {
                         "type": "session_finished",
                         "session_id": session_id,
@@ -952,13 +1001,18 @@ async def serve_ws_once(
                         "status": status,
                     }
                 )
-                LOCAL_COMMAND_REGISTRY.remove(session_id)
                 record_dashboard_event("command", f"monitored command {status}", f"{session_id} exit={exit_code} {truncate_dashboard_text(command, 90)}", status)
+            except asyncio.CancelledError:
+                raise
             except Exception as exc:
                 record_dashboard_event("command", "monitored command failed", f"{session_id} {exc}", "failed")
-                await send_json({"type": "session_failed", "session_id": session_id, "error": str(exc)})
+                await send_json_best_effort(
+                    {"type": "session_failed", "session_id": session_id, "error": str(exc)}
+                )
                 if request_id:
-                    await send_json({"type": "tool_result", "request_id": request_id, "ok": False, "error": str(exc)})
+                    await send_json_best_effort(
+                        {"type": "tool_result", "request_id": request_id, "ok": False, "error": str(exc)}
+                    )
             finally:
                 LOCAL_COMMAND_REGISTRY.remove(session_id)
 
@@ -966,10 +1020,14 @@ async def serve_ws_once(
             session_id = str(arguments.get("session_id", ""))
             force = bool(arguments.get("force", False))
             if not LOCAL_COMMAND_REGISTRY.terminate(session_id, force=force):
-                await send_json({"type": "tool_result", "request_id": request_id, "ok": False, "error": "Monitored process not found"})
+                await send_json_best_effort(
+                    {"type": "tool_result", "request_id": request_id, "ok": False, "error": "Monitored process not found"}
+                )
                 return
             record_dashboard_event("command", "termination requested", f"{session_id} force={force}", "running")
-            await send_json({"type": "tool_result", "request_id": request_id, "ok": True, "result": {"session_id": session_id, "terminated": True, "force": force}})
+            await send_json_best_effort(
+                {"type": "tool_result", "request_id": request_id, "ok": True, "result": {"session_id": session_id, "terminated": True, "force": force}}
+            )
 
         if LOCAL_COMMAND_REGISTRY.active_count():
             await send_json(
@@ -993,10 +1051,10 @@ async def serve_ws_once(
                 tool = str(message.get("tool", ""))
                 arguments = dict(message.get("arguments") or {})
                 if tool == "run_monitored_command":
-                    asyncio.create_task(run_monitored_command(request_id, arguments))
+                    spawn_background_task(run_monitored_command(request_id, arguments))
                     continue
                 if tool == "terminate_session":
-                    asyncio.create_task(terminate_monitored_command(request_id, arguments))
+                    spawn_background_task(terminate_monitored_command(request_id, arguments))
                     continue
                 try:
                     if tool.startswith("browser_"):
@@ -1016,6 +1074,7 @@ async def serve_ws_once(
         finally:
             heartbeat_task.cancel()
             receive_task.cancel()
+            await asyncio.gather(heartbeat_task, receive_task, return_exceptions=True)
             await browser_runtime.close_all()
 
 
@@ -1240,7 +1299,7 @@ def build_parser() -> argparse.ArgumentParser:
     sandbox_parser.set_defaults(func=sandbox_call)
 
     login_parser = subparsers.add_parser("login")
-    login_parser.add_argument("--gateway", default="http://localhost:8000")
+    login_parser.add_argument("--gateway", default=default_gateway_url())
     login_parser.add_argument("--directory", default=".")
     login_parser.add_argument("--device-code")
     login_parser.add_argument("--user-code")
@@ -1266,7 +1325,7 @@ def build_parser() -> argparse.ArgumentParser:
     login_parser.set_defaults(func=login)
 
     monitor_parser = subparsers.add_parser("monitor")
-    monitor_parser.add_argument("--gateway", default="http://localhost:8000")
+    monitor_parser.add_argument("--gateway", default=default_gateway_url())
     monitor_parser.add_argument("--directory", default=".")
     monitor_subparsers = monitor_parser.add_subparsers(dest="monitor_command", required=True)
 
@@ -1296,7 +1355,11 @@ def build_parser() -> argparse.ArgumentParser:
 def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
-    return int(args.func(args))
+    try:
+        return int(args.func(args))
+    except KeyboardInterrupt:
+        print("Good bye!")
+        return 0
 
 
 if __name__ == "__main__":

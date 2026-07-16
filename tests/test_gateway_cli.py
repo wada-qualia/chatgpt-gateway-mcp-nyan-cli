@@ -183,7 +183,175 @@ def test_login_reuses_saved_session_without_device_code(monkeypatch, tmp_path: P
 
 def test_cli_version(capsys) -> None:
     assert cli.main(["version"]) == 0
-    assert "gateway-cli 0.2.7" in capsys.readouterr().out
+    assert "gateway-cli 0.2.8" in capsys.readouterr().out
+
+
+def test_default_gateway_url_uses_environment(monkeypatch) -> None:
+    monkeypatch.setenv("GATEWAY_URL", "https://gateway.example.test/")
+
+    assert cli.default_gateway_url() == "https://gateway.example.test"
+    assert cli.build_parser().parse_args(["login"]).gateway == "https://gateway.example.test"
+    assert cli.build_parser().parse_args(["monitor", "list"]).gateway == "https://gateway.example.test"
+
+
+def test_default_gateway_url_falls_back_for_blank_environment(monkeypatch) -> None:
+    monkeypatch.setenv("GATEWAY_URL", "   ")
+
+    assert cli.default_gateway_url() == cli.DEFAULT_GATEWAY_URL
+
+
+def test_send_json_if_connected_ignores_retryable_connection_close() -> None:
+    class ConnectionClosedError(Exception):
+        pass
+
+    fake_websockets = types.SimpleNamespace(
+        exceptions=types.SimpleNamespace(ConnectionClosedError=ConnectionClosedError)
+    )
+
+    async def send_json(payload: dict) -> None:
+        raise ConnectionClosedError("keepalive ping timeout")
+
+    assert asyncio.run(cli.send_json_if_connected(send_json, {"type": "session_failed"}, fake_websockets)) is False
+
+
+def test_send_json_if_connected_reraises_non_transport_error() -> None:
+    fake_websockets = types.SimpleNamespace(exceptions=types.SimpleNamespace())
+
+    async def send_json(payload: dict) -> None:
+        raise ValueError("invalid payload")
+
+    try:
+        asyncio.run(cli.send_json_if_connected(send_json, {"type": "tool_result"}, fake_websockets))
+    except ValueError as exc:
+        assert str(exc) == "invalid payload"
+    else:
+        raise NoteError("send_json_if_connected swallowed a non-transport error")
+
+
+def test_serve_ws_once_consumes_background_failure_when_transport_closes(monkeypatch, tmp_path: Path) -> None:
+    class ConnectionClosedError(Exception):
+        pass
+
+    class EmptyReader:
+        async def readline(self) -> bytes:
+            return b""
+
+    class FailingProcess:
+        def __init__(self) -> None:
+            self.pid = 4242
+            self.returncode = None
+            self.stdout = EmptyReader()
+            self.stderr = EmptyReader()
+
+        async def wait(self) -> int:
+            raise RuntimeError("process wait failed")
+
+    class FakeWebSocket:
+        def __init__(self) -> None:
+            self.sent: list[dict] = []
+            self.session_failed = asyncio.Event()
+
+        async def send(self, raw: str) -> None:
+            payload = json.loads(raw)
+            self.sent.append(payload)
+            if payload.get("type") == "session_failed":
+                self.session_failed.set()
+                raise ConnectionClosedError("keepalive ping timeout")
+
+        def __aiter__(self):
+            return self.messages()
+
+        async def messages(self):
+            yield json.dumps(
+                {
+                    "type": "tool_call",
+                    "request_id": "request-1",
+                    "tool": "run_monitored_command",
+                    "arguments": {"session_id": "session-1", "command": "false", "cwd": "."},
+                }
+            )
+            await self.session_failed.wait()
+            raise ConnectionClosedError("keepalive ping timeout")
+
+    class FakeConnectionContext:
+        def __init__(self, websocket: FakeWebSocket) -> None:
+            self.websocket = websocket
+
+        async def __aenter__(self) -> FakeWebSocket:
+            return self.websocket
+
+        async def __aexit__(self, exc_type, exc, traceback_value) -> bool:
+            return False
+
+    class FakeBrowserRuntime:
+        def __init__(self, root: Path) -> None:
+            self.root = root
+
+        async def close_all(self) -> None:
+            browser_closed.append(True)
+
+    websocket = FakeWebSocket()
+    browser_closed: list[bool] = []
+    dashboard_events: list[tuple[str, str]] = []
+    loop_errors: list[dict] = []
+    registry = cli.LocalCommandRegistry()
+    fake_websockets = types.SimpleNamespace(
+        connect=lambda *args, **kwargs: FakeConnectionContext(websocket),
+        exceptions=types.SimpleNamespace(ConnectionClosedError=ConnectionClosedError),
+    )
+
+    async def create_subprocess_shell(*args, **kwargs) -> FailingProcess:
+        return FailingProcess()
+
+    def record_event(kind: str, title: str, detail: str, status: str, payload: dict | None = None) -> None:
+        dashboard_events.append((kind, title))
+
+    async def run() -> None:
+        loop = asyncio.get_running_loop()
+        loop.set_exception_handler(lambda current_loop, context: loop_errors.append(context))
+        try:
+            await cli.serve_ws_once(
+                "http://gateway",
+                "client-1",
+                "token",
+                ThinClientSandbox(tmp_path),
+                on_dashboard_event=record_event,
+            )
+        except ConnectionClosedError:
+            pass
+        else:
+            raise NoteError("serve_ws_once did not propagate the transport close")
+        await asyncio.sleep(0)
+
+    monkeypatch.setitem(sys.modules, "websockets", fake_websockets)
+    monkeypatch.setattr(cli, "ThinClientBrowserRuntime", FakeBrowserRuntime)
+    monkeypatch.setattr(cli.asyncio, "create_subprocess_shell", create_subprocess_shell)
+    monkeypatch.setattr(cli, "LOCAL_COMMAND_REGISTRY", registry)
+
+    asyncio.run(run())
+
+    assert any(payload.get("type") == "session_failed" for payload in websocket.sent)
+    assert ("command", "monitored command failed") in dashboard_events
+    assert ("client", "background task failed") not in dashboard_events
+    assert registry.active_count() == 0
+    assert browser_closed == [True]
+    assert loop_errors == []
+
+
+def test_main_handles_keyboard_interrupt_without_traceback(monkeypatch, capsys) -> None:
+    def interrupt(_args) -> int:
+        raise KeyboardInterrupt()
+
+    parser = types.SimpleNamespace(
+        parse_args=lambda argv: types.SimpleNamespace(func=interrupt)
+    )
+    monkeypatch.setattr(cli, "build_parser", lambda: parser)
+
+    assert cli.main([]) == 0
+
+    captured = capsys.readouterr()
+    assert captured.out == "Good bye!\n"
+    assert "Traceback" not in captured.err
 
 
 def test_thin_client_installer_bundles_runtime_dependencies() -> None:
