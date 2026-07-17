@@ -148,19 +148,21 @@ def test_login_reports_device_code_connection_error_without_traceback(monkeypatc
 
 def test_login_reuses_saved_session_without_device_code(monkeypatch, tmp_path: Path, capsys) -> None:
     monkeypatch.setenv("GATEWAY_THIN_CLIENT_HOME", str(tmp_path / ".client-home"))
-    token = fake_jwt()
+    saved_token = fake_jwt()
     cli.save_session(
         "http://gateway",
         tmp_path,
         client={"id": "client-1", "hostname": "host", "directory": str(tmp_path.resolve())},
-        token=token,
+        token=saved_token,
     )
     calls: list[str] = []
     served: list[tuple[str, str, str]] = []
 
     def fake_request_json(method: str, url: str, payload: dict | None = None, token: str | None = None) -> dict:
         calls.append(url)
-        raise NoteError(url)
+        assert url.endswith("/api/thin-clients/register")
+        assert token == saved_token
+        return {"id": "client-1", "hostname": "host", "directory": str(tmp_path.resolve())}
 
     async def fake_serve_ws(gateway: str, client_id: str, token_arg: str, sandbox: ThinClientSandbox, **kwargs) -> None:
         served.append((gateway, client_id, token_arg, kwargs))
@@ -171,10 +173,11 @@ def test_login_reuses_saved_session_without_device_code(monkeypatch, tmp_path: P
     assert cli.main(["login", "--gateway", "http://gateway", "--directory", str(tmp_path), "--serve"]) == 0
 
     output = capsys.readouterr().out
+    assert "reauthorized_session" in output
     assert "reused_session" in output
     assert "client-1" in output
-    assert calls == []
-    assert served == [("http://gateway", "client-1", token, served[0][3])]
+    assert calls == ["http://gateway/api/thin-clients/register"]
+    assert served == [("http://gateway", "client-1", saved_token, served[0][3])]
     assert served[0][3]["open_timeout"] == 10.0
     assert served[0][3]["ping_interval"] == 20.0
     assert served[0][3]["ping_timeout"] == 20.0
@@ -183,7 +186,53 @@ def test_login_reuses_saved_session_without_device_code(monkeypatch, tmp_path: P
 
 def test_cli_version(capsys) -> None:
     assert cli.main(["version"]) == 0
-    assert "gateway-cli 0.2.8" in capsys.readouterr().out
+    assert "gateway-cli 0.2.9" in capsys.readouterr().out
+
+
+def test_login_falls_back_to_device_code_when_saved_token_is_rejected(monkeypatch, tmp_path: Path, capsys) -> None:
+    monkeypatch.setenv("GATEWAY_THIN_CLIENT_HOME", str(tmp_path / ".client-home"))
+    old_token = fake_jwt(exp=int(time.time()) + 1800)
+    new_token = fake_jwt(exp=int(time.time()) + 3600)
+    cli.save_session(
+        "http://gateway",
+        tmp_path,
+        client={"id": "old-client", "hostname": "host", "directory": str(tmp_path.resolve())},
+        token=old_token,
+    )
+
+    def fake_request_json(method: str, url: str, payload: dict | None = None, token: str | None = None) -> dict:
+        if url.endswith("/api/thin-clients/register") and token == old_token:
+            raise HTTPError(url, 401, "Unauthorized", {}, io.BytesIO(b'{"detail":"Invalid bearer token"}'))
+        if url.endswith("/api/thin-clients/device-code"):
+            return {"device_code": "new-device", "user_code": "NEW123", "verification_uri": "http://gateway/activate", "interval": 0}
+        if url.endswith("/api/thin-clients/token"):
+            return {"access_token": new_token}
+        if url.endswith("/api/thin-clients/register"):
+            return {"id": "new-client", "hostname": "host", "directory": str(tmp_path.resolve())}
+        raise NoteError(url)
+
+    monkeypatch.setattr(cli, "request_json", fake_request_json)
+
+    assert cli.main(["login", "--gateway", "http://gateway", "--directory", str(tmp_path)]) == 0
+    output = capsys.readouterr().out
+    assert "NEW123" in output
+    assert "new-client" in output
+
+
+def test_activation_url_is_clickable_in_supported_terminal(monkeypatch) -> None:
+    monkeypatch.setattr(cli, "stdout_supports_hyperlinks", lambda: True)
+    url = "https://gateway.example/thin-clients/activate"
+
+    rendered = cli.terminal_hyperlink(url)
+
+    assert rendered == f"\033]8;;{url}\033\\{url}\033]8;;\033\\"
+
+
+def test_activation_url_stays_plain_outside_terminal(monkeypatch) -> None:
+    monkeypatch.setattr(cli, "stdout_supports_hyperlinks", lambda: False)
+    url = "https://gateway.example/thin-clients/activate"
+
+    assert cli.terminal_hyperlink(url) == url
 
 
 def test_default_gateway_url_uses_environment(monkeypatch) -> None:

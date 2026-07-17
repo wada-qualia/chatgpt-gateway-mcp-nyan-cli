@@ -14,7 +14,7 @@ import traceback
 from dataclasses import dataclass, field
 from pathlib import Path
 from urllib.error import HTTPError, URLError
-from urllib.parse import urljoin, urlencode
+from urllib.parse import urljoin, urlencode, urlsplit
 from urllib.request import Request, urlopen
 
 from . import __version__
@@ -723,6 +723,12 @@ def write_sessions(sessions: dict) -> None:
         pass
 
 
+def delete_session(gateway: str, directory: Path) -> None:
+    sessions = load_sessions()
+    if sessions.pop(session_key(gateway, directory), None) is not None:
+        write_sessions(sessions)
+
+
 def load_valid_session(gateway: str, directory: Path) -> dict | None:
     session = load_sessions().get(session_key(gateway, directory))
     if not isinstance(session, dict):
@@ -752,6 +758,28 @@ def save_session(gateway: str, directory: Path, *, client: dict, token: str) -> 
         "version": __version__,
     }
     write_sessions(sessions)
+
+
+def registration_payload(directory: Path) -> dict:
+    return {
+        "hostname": socket.gethostname(),
+        "directory": str(directory.resolve()),
+        "labels": {"client": "gateway-cli", "version": __version__},
+    }
+
+
+def stdout_supports_hyperlinks() -> bool:
+    return bool(sys.stdout.isatty() and os.environ.get("TERM", "") not in {"", "dumb"})
+
+
+def terminal_hyperlink(url: str) -> str:
+    """Render a safe OSC-8 hyperlink, preserving a plain URL fallback."""
+    if not stdout_supports_hyperlinks() or any(ord(character) < 32 for character in url):
+        return url
+    parsed = urlsplit(url)
+    if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+        return url
+    return f"\033]8;;{url}\033\\{url}\033]8;;\033\\"
 
 
 def load_monitor_session(gateway: str, directory: Path) -> dict:
@@ -1200,12 +1228,31 @@ def login(args: argparse.Namespace) -> int:
     if not args.device_code and not args.force_auth:
         session = load_valid_session(gateway, root)
         if session:
+            try:
+                client = request_json(
+                    "POST",
+                    urljoin(gateway, "/api/thin-clients/register"),
+                    registration_payload(root),
+                    token=str(session["token"]),
+                )
+            except HTTPError as exc:
+                if exc.code not in {401, 403}:
+                    print(f"gateway-cli login: saved-session reauthorization failed: {http_error_message(exc)}", file=sys.stderr)
+                    return 1
+                delete_session(gateway, root)
+                session = None
+            except URLError as exc:
+                print(f"gateway-cli login: saved-session reauthorization failed: {http_error_message(exc)}", file=sys.stderr)
+                return 1
+        if session:
+            save_session(gateway, root, client=client, token=str(session["token"]))
             print(
                 json.dumps(
                     {
-                        "client_id": session["client_id"],
-                        "directory": session["directory"],
-                        "hostname": session.get("hostname") or socket.gethostname(),
+                        "client_id": client["id"],
+                        "directory": client["directory"],
+                        "hostname": client.get("hostname") or socket.gethostname(),
+                        "reauthorized_session": True,
                         "reused_session": True,
                         "version": __version__,
                     },
@@ -1217,10 +1264,10 @@ def login(args: argparse.Namespace) -> int:
                     asyncio.run(
                         serve_ws(
                             gateway,
-                            str(session["client_id"]),
+                            str(client["id"]),
                             str(session["token"]),
                             sandbox,
-                            **serve_ws_kwargs_from_args(args, gateway, str(session["client_id"]), root),
+                            **serve_ws_kwargs_from_args(args, gateway, str(client["id"]), root),
                         )
                     )
                 except RuntimeError as exc:
@@ -1245,7 +1292,7 @@ def login(args: argparse.Namespace) -> int:
         interval = int(device.get("interval", args.interval))
 
     if user_code and verification_uri:
-        print(f"Open {verification_uri} and enter code {user_code}")
+        print(f"Open {terminal_hyperlink(verification_uri)} and enter code {user_code}")
     elif user_code:
         print(f"Authorize thin client with code {user_code}")
     else:
@@ -1255,13 +1302,8 @@ def login(args: argparse.Namespace) -> int:
     except (HTTPError, URLError) as exc:
         print(f"gateway-cli login: device-code authorization failed: {http_error_message(exc)}", file=sys.stderr)
         return 1
-    register_payload = {
-        "hostname": socket.gethostname(),
-        "directory": str(root),
-        "labels": {"client": "gateway-cli", "version": __version__},
-    }
     try:
-        client = request_json("POST", urljoin(gateway, "/api/thin-clients/register"), register_payload, token=token)
+        client = request_json("POST", urljoin(gateway, "/api/thin-clients/register"), registration_payload(root), token=token)
     except (HTTPError, URLError) as exc:
         print(f"gateway-cli login: registration failed: {http_error_message(exc)}", file=sys.stderr)
         return 1
