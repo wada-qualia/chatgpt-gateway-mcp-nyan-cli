@@ -186,7 +186,7 @@ def test_login_reuses_saved_session_without_device_code(monkeypatch, tmp_path: P
 
 def test_cli_version(capsys) -> None:
     assert cli.main(["version"]) == 0
-    assert "gateway-cli 0.2.9" in capsys.readouterr().out
+    assert "gateway-cli 0.2.10" in capsys.readouterr().out
 
 
 def test_login_falls_back_to_device_code_when_saved_token_is_rejected(monkeypatch, tmp_path: Path, capsys) -> None:
@@ -574,6 +574,27 @@ def test_serve_ws_retries_invalid_message_without_traceback(monkeypatch, tmp_pat
     assert "InvalidMessage: did not receive a valid HTTP response" in stderr
     assert "next_retry=1.0s" in stderr
     assert "Traceback" not in stderr
+
+
+def test_websocket_http_404_is_retryable() -> None:
+    class InvalidStatus(Exception):
+        def __init__(self) -> None:
+            super().__init__("server rejected WebSocket connection: HTTP 404")
+            self.response = types.SimpleNamespace(status_code=404)
+
+    fake_websockets = types.SimpleNamespace(
+        exceptions=types.SimpleNamespace(InvalidHandshake=InvalidStatus)
+    )
+
+    assert cli.is_retryable_websocket_error(InvalidStatus(), fake_websockets)
+
+
+def test_websocket_authorization_uses_header_not_query_string() -> None:
+    current = cli.websocket_authorization_kwargs(types.SimpleNamespace(__version__="15.0.1"), "secret-token")
+    legacy = cli.websocket_authorization_kwargs(types.SimpleNamespace(__version__="12.0"), "secret-token")
+
+    assert current == {"additional_headers": {"Authorization": "Bearer secret-token"}}
+    assert legacy == {"extra_headers": {"Authorization": "Bearer secret-token"}}
 
 
 def test_serve_ws_keeps_auth_close_code_fatal(monkeypatch, tmp_path: Path) -> None:

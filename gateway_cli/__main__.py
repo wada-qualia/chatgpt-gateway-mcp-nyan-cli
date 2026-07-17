@@ -26,6 +26,7 @@ WEBSOCKET_RECONNECT_SECONDS = 1.0
 WEBSOCKET_RECONNECT_FACTOR = 1.6
 WEBSOCKET_RECONNECT_JITTER_RATIO = 0.2
 TERMINAL_WEBSOCKET_CLOSE_CODES = {4401, 4404}
+RETRYABLE_WEBSOCKET_HTTP_STATUSES = {404, 408, 425, 429, 500, 502, 503, 504}
 DASHBOARD_EVENT_CACHE_SIZE = 64
 DEFAULT_GATEWAY_URL = "http://localhost:8000"
 
@@ -113,11 +114,22 @@ def is_retryable_websocket_error(exc: BaseException, websockets_module: object) 
 
     if retryable_exception_types and isinstance(exc, tuple(retryable_exception_types)):
         status_code = websocket_status_code(exc)
-        if status_code is not None and status_code not in {408, 425, 429, 500, 502, 503, 504}:
+        if status_code is not None and status_code not in RETRYABLE_WEBSOCKET_HTTP_STATUSES:
             return False
         return True
 
     return False
+
+
+def websocket_authorization_kwargs(websockets_module: object, token: str) -> dict:
+    """Build the version-specific websockets header argument without putting JWTs in URLs."""
+    version = str(getattr(websockets_module, "__version__", "0"))
+    try:
+        major = int(version.split(".", 1)[0])
+    except ValueError:
+        major = 0
+    parameter = "additional_headers" if major >= 14 else "extra_headers"
+    return {parameter: {"Authorization": f"Bearer {token}"}}
 
 
 def compact_exception_message(exc: BaseException) -> str:
@@ -904,8 +916,14 @@ async def serve_ws_once(
     except ImportError as exc:
         raise RuntimeError("Install websockets to use --serve") from exc
     ws_base = gateway.replace("https://", "wss://").replace("http://", "ws://").rstrip("/")
-    url = f"{ws_base}/api/thin-clients/ws/{client_id}?{urlencode({'token': token})}"
-    async with websockets.connect(url, open_timeout=open_timeout, ping_interval=ping_interval, ping_timeout=ping_timeout) as websocket:
+    url = f"{ws_base}/api/thin-clients/ws/{client_id}"
+    async with websockets.connect(
+        url,
+        open_timeout=open_timeout,
+        ping_interval=ping_interval,
+        ping_timeout=ping_timeout,
+        **websocket_authorization_kwargs(websockets, token),
+    ) as websocket:
         if on_connected is not None:
             on_connected()
         send_lock = asyncio.Lock()
