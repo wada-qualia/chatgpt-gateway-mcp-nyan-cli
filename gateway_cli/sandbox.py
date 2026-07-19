@@ -4,6 +4,7 @@ import base64
 import binascii
 import difflib
 import fnmatch
+import hashlib
 import os
 import re
 import subprocess
@@ -69,12 +70,67 @@ class ThinClientSandbox:
             )
         return {"root": str(self.root), "entries": entries}
 
+    def file_state(self, path: str) -> dict[str, Any]:
+        target = self.safe_path(path)
+        if not target.exists():
+            return {"path": self.relative(target), "exists": False, "kind": None, "size": None, "sha256": None}
+        if target.is_dir():
+            return {"path": self.relative(target), "exists": True, "kind": "dir", "size": None, "sha256": None}
+        raw = target.read_bytes()
+        return {
+            "path": self.relative(target),
+            "exists": True,
+            "kind": "file",
+            "size": len(raw),
+            "sha256": hashlib.sha256(raw).hexdigest(),
+        }
+
+    def git_state(self, worktree_path: str, base_commit: str) -> dict[str, Any]:
+        worktree = self.safe_path(worktree_path)
+        if not worktree.is_dir():
+            raise SandboxError("Git worktree path is not a directory")
+
+        def git(*arguments: str, check: bool = True) -> subprocess.CompletedProcess[str]:
+            completed = subprocess.run(
+                ["git", "-C", str(worktree), *arguments],
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                timeout=15,
+            )
+            if check and completed.returncode != 0:
+                detail = (completed.stderr or completed.stdout).strip() or "git command failed"
+                raise SandboxError(detail)
+            return completed
+
+        root = Path(git("rev-parse", "--show-toplevel").stdout.strip()).resolve()
+        branch = git("symbolic-ref", "--quiet", "--short", "HEAD").stdout.strip()
+        head = git("rev-parse", "HEAD").stdout.strip()
+        ancestor = git("merge-base", "--is-ancestor", base_commit, head, check=False).returncode == 0
+        return {
+            "worktree_path": self.relative(worktree),
+            "toplevel": self.relative(root) if root == self.root or self.root in root.parents else str(root),
+            "branch_name": branch,
+            "head": head,
+            "base_commit": base_commit,
+            "base_is_ancestor": ancestor,
+        }
+
     def read_file(self, path: str) -> dict[str, Any]:
         target = self.safe_path(path)
         if not target.is_file():
             raise SandboxError("Path is not a file")
-        data = target.read_bytes()[: self.max_read_bytes]
-        return {"path": self.relative(target), "content": data.decode("utf-8", errors="replace"), "truncated": target.stat().st_size > len(data)}
+        raw = target.read_bytes()
+        data = raw[: self.max_read_bytes]
+        return {
+            "path": self.relative(target),
+            "content": data.decode("utf-8", errors="replace"),
+            "truncated": len(raw) > len(data),
+            "exists": True,
+            "size": len(raw),
+            "sha256": hashlib.sha256(raw).hexdigest(),
+        }
 
     def decode_write_content(self, arguments: dict[str, Any], *, required: bool = True) -> tuple[bytes, str | None]:
         if "content_base64" in arguments and arguments.get("content_base64") is not None:
@@ -101,7 +157,20 @@ class ThinClientSandbox:
         operation = str(args.get("operation") or "write")
         target = self.safe_path(path)
         relative_path = self.relative(target)
-        bytes_before = target.stat().st_size if target.exists() and target.is_file() else 0
+        existed_before = target.exists() and target.is_file()
+        bytes_before = target.stat().st_size if existed_before else 0
+        expected_sha256 = str(args.get("expected_sha256") or "").strip() or None
+        expected_absent = bool(args.get("expected_absent", False))
+        if expected_sha256 and expected_absent:
+            raise SandboxError("expected_sha256 and expected_absent are mutually exclusive")
+        if expected_absent and target.exists():
+            raise SandboxError("File precondition failed: path already exists")
+        if expected_sha256:
+            if not existed_before:
+                raise SandboxError("File precondition failed: path is not a file")
+            current_sha256 = hashlib.sha256(target.read_bytes()).hexdigest()
+            if current_sha256 != expected_sha256:
+                raise SandboxError("File precondition failed: sha256 mismatch")
         return_content = bool(args.get("return_content", False))
         include_diff = bool(args.get("diff", True))
 
@@ -113,8 +182,8 @@ class ThinClientSandbox:
                 raise SandboxError("File already exists and overwrite is false")
             if operation == "append" and "content_base64" in args:
                 raise SandboxError("append supports UTF-8 content only")
-            original_raw = target.read_bytes() if operation == "append" and target.exists() else b""
-            final = original_raw + raw
+            original_raw = target.read_bytes() if existed_before else b""
+            final = original_raw + raw if operation == "append" else raw
             diff_payload = self.build_write_diff(relative_path, original_raw, final, encoding=encoding, include_diff=include_diff)
             self.write_bytes(target, final, mode=args.get("mode"))
             result = {
@@ -126,6 +195,8 @@ class ThinClientSandbox:
                 "encoding": encoding,
                 "replacements": 0,
                 "content": None,
+                "before_sha256": hashlib.sha256(original_raw).hexdigest() if existed_before else None,
+                "after_sha256": hashlib.sha256(final).hexdigest(),
                 "diff": diff_payload,
             }
             if return_content and encoding == "utf-8":
@@ -140,6 +211,7 @@ class ThinClientSandbox:
                 raise SandboxError(f"Expected {int(expected)} replacements, got {replacements}")
             if replacements <= 0 and operation != "remove_markdown_code_blocks":
                 raise SandboxError(f"No text matched operation {operation!r}")
+            original_raw = original.encode("utf-8")
             raw = edited.encode("utf-8")
             diff_payload = self.build_text_diff(relative_path, original, edited, include_diff=include_diff)
             self.write_bytes(target, raw, mode=args.get("mode"))
@@ -152,6 +224,8 @@ class ThinClientSandbox:
                 "encoding": "utf-8",
                 "replacements": replacements,
                 "content": edited if return_content else None,
+                "before_sha256": hashlib.sha256(original_raw).hexdigest(),
+                "after_sha256": hashlib.sha256(raw).hexdigest(),
                 "diff": diff_payload,
             }
 
@@ -349,6 +423,13 @@ class ThinClientSandbox:
             return self.list_files(str(arguments.get("path", ".")))
         if tool == "read_file":
             return self.read_file(str(arguments.get("path", "")))
+        if tool == "file_state":
+            return self.file_state(str(arguments.get("path", "")))
+        if tool == "git_state":
+            return self.git_state(
+                str(arguments.get("worktree_path", "")),
+                str(arguments.get("base_commit", "")),
+            )
         if tool == "write_file":
             return self.write_file(str(arguments.get("path", "")), arguments=arguments)
         if tool == "run_command":

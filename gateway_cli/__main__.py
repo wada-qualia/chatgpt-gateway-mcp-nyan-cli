@@ -1177,8 +1177,24 @@ async def serve_ws(
                         "Saved thin-client session is no longer valid. Run gateway-cli login --force-auth to authorize again."
                     ) from exc
                 if not is_retryable_websocket_error(exc, websockets):
-                    renderer.update("STOPPED", last_error=compact_exception_message(exc))
-                    raise
+                    message = compact_exception_message(exc)
+                    status_code = websocket_status_code(exc)
+                    if status_code in {401, 403}:
+                        renderer.update("AUTH_EXPIRED", last_error=message)
+                        raise RuntimeError(
+                            "Gateway rejected WebSocket authorization. "
+                            "Run gateway-cli login --force-auth to authorize again."
+                        ) from exc
+                    if status_code == 404:
+                        endpoint = f"{gateway.rstrip('/')}/api/thin-clients/ws/{client_id}"
+                        renderer.update("STOPPED", last_error=message)
+                        raise RuntimeError(
+                            f"WebSocket endpoint was not found: {endpoint}. "
+                            "Check that --gateway points to gateway-api, that the proxy forwards "
+                            "WebSocket upgrades, and that the current gateway-api version is deployed."
+                        ) from exc
+                    renderer.update("STOPPED", last_error=message)
+                    raise RuntimeError(f"WebSocket connection failed: {message}") from exc
                 attempt += 1
                 if max_reconnect_attempts is not None and attempt > max_reconnect_attempts:
                     renderer.update("STOPPED", attempt=attempt, last_error=compact_exception_message(exc))

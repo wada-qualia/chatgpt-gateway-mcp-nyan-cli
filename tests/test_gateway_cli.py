@@ -186,7 +186,7 @@ def test_login_reuses_saved_session_without_device_code(monkeypatch, tmp_path: P
 
 def test_cli_version(capsys) -> None:
     assert cli.main(["version"]) == 0
-    assert "gateway-cli 0.2.10" in capsys.readouterr().out
+    assert "gateway-cli 0.3.0" in capsys.readouterr().out
 
 
 def test_login_falls_back_to_device_code_when_saved_token_is_rejected(monkeypatch, tmp_path: Path, capsys) -> None:
@@ -595,6 +595,42 @@ def test_websocket_authorization_uses_header_not_query_string() -> None:
 
     assert current == {"additional_headers": {"Authorization": "Bearer secret-token"}}
     assert legacy == {"extra_headers": {"Authorization": "Bearer secret-token"}}
+def test_serve_ws_retries_keepalive_ping_timeout(monkeypatch, tmp_path: Path) -> None:
+    class ConnectionClosedError(Exception):
+        pass
+
+    class StopRetry(Exception):
+        pass
+
+    fake_websockets = types.SimpleNamespace(
+        exceptions=types.SimpleNamespace(ConnectionClosedError=ConnectionClosedError)
+    )
+    monkeypatch.setitem(sys.modules, "websockets", fake_websockets)
+
+    async def fake_serve_ws_once(*args, **kwargs) -> None:
+        raise ConnectionClosedError("sent 1011 keepalive ping timeout")
+
+    async def fake_sleep(delay: float) -> None:
+        assert delay == 1.0
+        raise StopRetry()
+
+    monkeypatch.setattr(cli, "serve_ws_once", fake_serve_ws_once)
+    monkeypatch.setattr(cli.asyncio, "sleep", fake_sleep)
+
+    try:
+        asyncio.run(
+            cli.serve_ws(
+                "http://gateway",
+                "client-1",
+                "token",
+                ThinClientSandbox(tmp_path),
+                reconnect_policy=cli.ReconnectPolicy(initial_delay=1.0, max_delay=1.0, jitter_ratio=0.0),
+            )
+        )
+    except StopRetry:
+        pass
+    else:
+        raise NoteError("serve_ws did not retry after a keepalive ping timeout")
 
 
 def test_serve_ws_keeps_auth_close_code_fatal(monkeypatch, tmp_path: Path) -> None:
