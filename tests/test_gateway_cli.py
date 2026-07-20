@@ -186,7 +186,7 @@ def test_login_reuses_saved_session_without_device_code(monkeypatch, tmp_path: P
 
 def test_cli_version(capsys) -> None:
     assert cli.main(["version"]) == 0
-    assert "gateway-cli 0.3.0" in capsys.readouterr().out
+    assert "gateway-cli 0.3.2" in capsys.readouterr().out
 
 
 def test_login_falls_back_to_device_code_when_saved_token_is_rejected(monkeypatch, tmp_path: Path, capsys) -> None:
@@ -233,6 +233,51 @@ def test_activation_url_stays_plain_outside_terminal(monkeypatch) -> None:
     url = "https://gateway.example/thin-clients/activate"
 
     assert cli.terminal_hyperlink(url) == url
+
+
+def test_activation_prompt_opens_browser_after_enter(monkeypatch) -> None:
+    class InteractiveInput:
+        @staticmethod
+        def isatty() -> bool:
+            return True
+
+    prompts: list[str] = []
+    opened: list[tuple[str, int, bool]] = []
+    url = "https://gateway.example/thin-clients/activate"
+    monkeypatch.setattr(cli.sys, "stdin", InteractiveInput())
+    monkeypatch.setattr(cli, "stdout_supports_hyperlinks", lambda: False)
+    monkeypatch.setattr("builtins.input", lambda prompt: prompts.append(prompt) or "")
+    monkeypatch.setattr(
+        cli.webbrowser,
+        "open",
+        lambda value, new=0, autoraise=True: opened.append((value, new, autoraise)) or True,
+    )
+
+    cli.open_verification_uri_on_enter(url, "107804")
+
+    assert prompts == [
+        "Open https://gateway.example/thin-clients/activate and enter code 107804. "
+        "Press ENTER to open the site..."
+    ]
+    assert opened == [(url, 2, True)]
+
+
+def test_activation_prompt_does_not_block_noninteractive_input(monkeypatch, capsys) -> None:
+    class NonInteractiveInput:
+        @staticmethod
+        def isatty() -> bool:
+            return False
+
+    opened: list[str] = []
+    url = "https://gateway.example/thin-clients/activate"
+    monkeypatch.setattr(cli.sys, "stdin", NonInteractiveInput())
+    monkeypatch.setattr(cli, "stdout_supports_hyperlinks", lambda: False)
+    monkeypatch.setattr(cli.webbrowser, "open", lambda value, **kwargs: opened.append(value) or True)
+
+    cli.open_verification_uri_on_enter(url, "107804")
+
+    assert "Press ENTER to open the site..." in capsys.readouterr().out
+    assert opened == []
 
 
 def test_default_gateway_url_uses_environment(monkeypatch) -> None:

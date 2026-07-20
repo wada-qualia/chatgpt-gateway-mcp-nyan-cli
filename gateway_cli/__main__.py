@@ -11,6 +11,7 @@ import socket
 import sys
 import time
 import traceback
+import webbrowser
 from dataclasses import dataclass, field
 from pathlib import Path
 from urllib.error import HTTPError, URLError
@@ -794,6 +795,34 @@ def terminal_hyperlink(url: str) -> str:
     return f"\033]8;;{url}\033\\{url}\033]8;;\033\\"
 
 
+def open_verification_uri_on_enter(verification_uri: str, user_code: str) -> None:
+    parsed = urlsplit(verification_uri)
+    if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+        print(f"gateway-cli login: invalid activation site: {verification_uri}", file=sys.stderr)
+        return
+    prompt = (
+        f"Open {terminal_hyperlink(verification_uri)} and enter code {user_code}. "
+        "Press ENTER to open the site..."
+    )
+    if not sys.stdin.isatty():
+        print(prompt)
+        return
+    try:
+        input(prompt)
+    except EOFError:
+        return
+    try:
+        opened = webbrowser.open(verification_uri, new=2, autoraise=True)
+    except (OSError, webbrowser.Error) as exc:
+        print(f"gateway-cli login: could not open activation site: {exc}", file=sys.stderr)
+        return
+    if not opened:
+        print(
+            f"gateway-cli login: could not open activation site automatically; open {verification_uri}",
+            file=sys.stderr,
+        )
+
+
 def load_monitor_session(gateway: str, directory: Path) -> dict:
     session = load_valid_session(gateway, directory)
     if session is None:
@@ -1326,7 +1355,7 @@ def login(args: argparse.Namespace) -> int:
         interval = int(device.get("interval", args.interval))
 
     if user_code and verification_uri:
-        print(f"Open {terminal_hyperlink(verification_uri)} and enter code {user_code}")
+        open_verification_uri_on_enter(verification_uri, user_code)
     elif user_code:
         print(f"Authorize thin client with code {user_code}")
     else:
