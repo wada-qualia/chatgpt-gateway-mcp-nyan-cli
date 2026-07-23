@@ -293,7 +293,12 @@ class TerminalDashboardRenderer:
             return
         self._rich_available = True
         self._tui_active = True
-        self._console = Console(file=self.stream, no_color=self.config.no_color)
+        self._console = Console(
+            file=self.stream,
+            no_color=self.config.no_color,
+            markup=False,
+            highlight=False,
+        )
         self._console.print(self._render_rich_history_header())
         for event in self.state.recent_events:
             self._console.print(self._render_rich_event(event))
@@ -303,6 +308,8 @@ class TerminalDashboardRenderer:
             auto_refresh=False,
             transient=False,
             vertical_overflow="visible",
+            redirect_stdout=False,
+            redirect_stderr=False,
         )
         self._live.start()
 
@@ -475,14 +482,14 @@ class TerminalDashboardRenderer:
         summary = Table.grid(padding=(0, 1))
         summary.add_column(style="bold")
         summary.add_column()
-        summary.add_row("Client", self.config.client_id)
-        summary.add_row("Host", self.config.hostname)
-        summary.add_row("Gateway", self.config.gateway)
-        summary.add_row("Directory", str(self.config.directory))
-        summary.add_row("State", self.state.connection_state)
-        summary.add_row("Events", str(self.state.event_count))
+        summary.add_row(Text("Client"), Text(self.config.client_id, overflow="fold"))
+        summary.add_row(Text("Host"), Text(self.config.hostname, overflow="fold"))
+        summary.add_row(Text("Gateway"), Text(self.config.gateway, overflow="fold"))
+        summary.add_row(Text("Directory"), Text(str(self.config.directory), overflow="fold"))
+        summary.add_row(Text("State"), Text(self.state.connection_state, overflow="fold"))
+        summary.add_row(Text("Events"), Text(str(self.state.event_count), overflow="fold"))
         if self.state.history_path:
-            summary.add_row("History", truncate_dashboard_text(self.state.history_path, 96))
+            summary.add_row("History", Text(truncate_dashboard_text(self.state.history_path, 96), overflow="fold"))
         if self.state.history_error:
             summary.add_row("History error", Text(truncate_dashboard_text(self.state.history_error, 120), style="yellow"))
         if self.state.connection_state == "RECONNECTING":
@@ -501,11 +508,11 @@ class TerminalDashboardRenderer:
         if self.state.active_sessions:
             for item in self.state.active_sessions:
                 commands.add_row(
-                    str(item["session_id"]),
-                    str(item["pid"]),
-                    str(item.get("command") or "-"),
-                    str(item.get("cwd") or "-"),
-                    str(item["returncode"]),
+                    Text(str(item["session_id"]), overflow="fold"),
+                    Text(str(item["pid"]), overflow="fold"),
+                    Text(str(item.get("command") or "-"), overflow="fold"),
+                    Text(str(item.get("cwd") or "-"), overflow="fold"),
+                    Text(str(item["returncode"]), overflow="fold"),
                 )
         else:
             commands.add_row("none", "-", "-", "-", "-")

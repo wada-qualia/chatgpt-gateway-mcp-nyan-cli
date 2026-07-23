@@ -186,7 +186,7 @@ def test_login_reuses_saved_session_without_device_code(monkeypatch, tmp_path: P
 
 def test_cli_version(capsys) -> None:
     assert cli.main(["version"]) == 0
-    assert "gateway-cli 0.3.6" in capsys.readouterr().out
+    assert "gateway-cli 0.3.7" in capsys.readouterr().out
 
 
 def test_login_falls_back_to_device_code_when_saved_token_is_rejected(monkeypatch, tmp_path: Path, capsys) -> None:
@@ -908,6 +908,69 @@ def test_terminal_dashboard_rich_layout_keeps_status_in_bottom_bar(tmp_path: Pat
     assert "session-1" in rendered
     assert "Events" in rendered
     assert "2" in rendered
+
+
+def test_terminal_dashboard_treats_external_strings_as_literal_text(tmp_path: Path) -> None:
+    from rich.console import Console
+
+    stream = io.StringIO()
+    renderer = cli.TerminalDashboardRenderer(
+        cli.TerminalDashboardConfig(
+            client_id="client-1",
+            directory=tmp_path,
+            gateway="http://gateway",
+            hostname="host",
+            persist_history=False,
+            use_tui=True,
+        ),
+        stream=io.StringIO(),
+    )
+    closing_markup_like_command = chr(91) + chr(47) + r"\.env(?:\.|$)/, /\.test-artifacts/, /\.tsx?$/, /\.map$/" + chr(93)
+    renderer.state.active_sessions = [
+        {
+            "command": closing_markup_like_command,
+            "cwd": "project/[literal]",
+            "pid": 123,
+            "returncode": None,
+            "session_id": "session-[literal]",
+            "started_at": 1.0,
+            "status": "running",
+        }
+    ]
+
+    console = Console(file=stream, force_terminal=False, width=500, color_system=None)
+    console.print(renderer._render_rich())
+    rendered = stream.getvalue()
+
+    for fragment in (r"\.env(?:\.|$)", r"\.test-artifacts", r"\.tsx?$", r"\.map$"):
+        assert fragment in rendered
+    assert "project/[literal]" in rendered
+    assert "session-[literal]" in rendered
+
+
+def test_terminal_dashboard_disables_markup_and_stdio_proxying(tmp_path: Path) -> None:
+    renderer = cli.TerminalDashboardRenderer(
+        cli.TerminalDashboardConfig(
+            client_id="client-1",
+            directory=tmp_path,
+            gateway="http://gateway",
+            hostname="host",
+            persist_history=False,
+            use_tui=True,
+        ),
+        stream=io.StringIO(),
+    )
+
+    renderer.start()
+    try:
+        assert renderer._console is not None
+        assert renderer._console._markup is False
+        assert renderer._console._highlight is False
+        assert renderer._live is not None
+        assert renderer._live._redirect_stdout is False
+        assert renderer._live._redirect_stderr is False
+    finally:
+        renderer.stop()
 
 
 def test_terminal_dashboard_bounds_memory_cache_without_losing_event_count(tmp_path: Path) -> None:
