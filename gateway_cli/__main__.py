@@ -20,6 +20,7 @@ from urllib.request import Request, urlopen
 
 from . import __version__
 from .browser import BrowserError, ThinClientBrowserRuntime
+from .local_mcp import LocalMcpHost
 from .sandbox import SandboxError, ThinClientSandbox
 
 SESSION_REUSE_MIN_TTL_SECONDS = 60
@@ -946,6 +947,7 @@ async def serve_ws_once(
     ping_timeout: float = 20.0,
     on_connected=None,
     on_dashboard_event=None,
+    mcp_host: LocalMcpHost | None = None,
 ) -> None:
     try:
         import websockets
@@ -1127,6 +1129,10 @@ async def serve_ws_once(
         async def receive() -> None:
             async for raw in websocket:
                 message = json.loads(raw)
+                if mcp_host is not None and await mcp_host.handle_gateway_message(
+                    message, send_json
+                ):
+                    continue
                 if message.get("type") != "tool_call":
                     continue
                 request_id = str(message.get("request_id", ""))
@@ -1158,6 +1164,8 @@ async def serve_ws_once(
             receive_task.cancel()
             await asyncio.gather(heartbeat_task, receive_task, return_exceptions=True)
             await browser_runtime.close_all()
+            if mcp_host is not None:
+                await mcp_host.on_disconnect()
 
 
 async def serve_ws(
@@ -1173,12 +1181,14 @@ async def serve_ws(
     ping_timeout: float = 20.0,
     debug: bool = False,
     dashboard: TerminalDashboardRenderer | None = None,
+    mcp_config: Path | None = None,
 ) -> None:
     try:
         import websockets
     except ImportError as exc:
         raise RuntimeError("Install websockets to use --serve") from exc
     policy = reconnect_policy or ReconnectPolicy()
+    mcp_host = LocalMcpHost.from_path(mcp_config) if mcp_config else None
     renderer = dashboard or TerminalDashboardRenderer(
         TerminalDashboardConfig(
             client_id=client_id,
@@ -1204,6 +1214,7 @@ async def serve_ws(
                     ping_timeout=ping_timeout,
                     on_connected=lambda: renderer.update("ONLINE", attempt=0),
                     on_dashboard_event=getattr(renderer, "record_event", None),
+                    mcp_host=mcp_host,
                 )
                 attempt = 0
             except Exception as exc:
@@ -1282,6 +1293,9 @@ def serve_ws_kwargs_from_args(args: argparse.Namespace, gateway: str, client_id:
         "ping_interval": float(args.ping_interval),
         "ping_timeout": float(args.ping_timeout),
         "reconnect_policy": reconnect_policy_from_args(args),
+        "mcp_config": Path(args.mcp_config).expanduser().resolve()
+        if args.mcp_config
+        else None,
     }
 
 
@@ -1418,6 +1432,10 @@ def build_parser() -> argparse.ArgumentParser:
     login_parser.add_argument("--verification-uri")
     login_parser.add_argument("--interval", type=int, default=3)
     login_parser.add_argument("--serve", action="store_true")
+    login_parser.add_argument(
+        "--mcp-config",
+        help="Client-owned JSON configuration for local/private MCP servers.",
+    )
     login_parser.add_argument("--connect-timeout", type=float, default=10.0)
     login_parser.add_argument("--ping-interval", type=float, default=20.0)
     login_parser.add_argument("--ping-timeout", type=float, default=20.0)
