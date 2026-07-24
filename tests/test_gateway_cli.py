@@ -186,7 +186,7 @@ def test_login_reuses_saved_session_without_device_code(monkeypatch, tmp_path: P
 
 def test_cli_version(capsys) -> None:
     assert cli.main(["version"]) == 0
-    assert "gateway-cli 0.3.7" in capsys.readouterr().out
+    assert "gateway-cli 0.3.8" in capsys.readouterr().out
 
 
 def test_login_falls_back_to_device_code_when_saved_token_is_rejected(monkeypatch, tmp_path: Path, capsys) -> None:
