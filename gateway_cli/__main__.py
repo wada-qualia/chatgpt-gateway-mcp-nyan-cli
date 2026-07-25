@@ -12,6 +12,7 @@ import sys
 import time
 import traceback
 import webbrowser
+from collections import deque
 from dataclasses import dataclass, field
 from pathlib import Path
 from urllib.error import HTTPError, URLError
@@ -261,6 +262,36 @@ class LocalCommandRegistry:
 
 
 LOCAL_COMMAND_REGISTRY = LocalCommandRegistry()
+
+
+class ReconnectOutboundBuffer:
+    def __init__(self, max_messages: int = 4096) -> None:
+        if max_messages < 1:
+            raise ValueError("max_messages must be positive")
+        self._items: deque[dict] = deque()
+        self._condition = asyncio.Condition()
+        self._max_messages = max_messages
+
+    async def put(self, payload: dict) -> None:
+        async with self._condition:
+            await self._condition.wait_for(lambda: len(self._items) < self._max_messages)
+            self._items.append(payload)
+            self._condition.notify_all()
+
+    async def send_forever(self, send_json) -> None:
+        while True:
+            async with self._condition:
+                await self._condition.wait_for(lambda: bool(self._items))
+                payload = self._items[0]
+            await send_json(payload)
+            async with self._condition:
+                if not self._items or self._items[0] is not payload:
+                    raise RuntimeError("outbound reconnect buffer order changed")
+                self._items.popleft()
+                self._condition.notify_all()
+
+    def pending_count(self) -> int:
+        return len(self._items)
 
 
 class TerminalDashboardRenderer:
@@ -948,6 +979,7 @@ async def serve_ws_once(
     on_connected=None,
     on_dashboard_event=None,
     mcp_host: LocalMcpHost | None = None,
+    outbound_buffer: ReconnectOutboundBuffer | None = None,
 ) -> None:
     try:
         import websockets
@@ -967,7 +999,7 @@ async def serve_ws_once(
         send_lock = asyncio.Lock()
         browser_runtime = ThinClientBrowserRuntime(sandbox.root)
         background_tasks: set[asyncio.Task] = set()
-        transport_available = True
+        reconnect_buffer = outbound_buffer or ReconnectOutboundBuffer()
 
         def spawn_background_task(coro) -> asyncio.Task:
             task = asyncio.create_task(coro)
@@ -992,13 +1024,8 @@ async def serve_ws_once(
                 await websocket.send(json.dumps(payload))
 
         async def send_json_best_effort(payload: dict) -> bool:
-            nonlocal transport_available
-            if not transport_available:
-                return False
-            sent = await send_json_if_connected(send_json, payload, websockets)
-            if not sent:
-                transport_available = False
-            return sent
+            await reconnect_buffer.put(payload)
+            return True
 
         def record_dashboard_event(kind: str, title: str, detail: str = "", status: str = "info", payload: dict | None = None) -> None:
             if on_dashboard_event is not None:
@@ -1157,12 +1184,14 @@ async def serve_ws_once(
 
         heartbeat_task = asyncio.create_task(heartbeat())
         receive_task = asyncio.create_task(receive())
+        outbound_sender_task = asyncio.create_task(reconnect_buffer.send_forever(send_json))
+        connection_tasks = (heartbeat_task, receive_task, outbound_sender_task)
         try:
-            await asyncio.gather(heartbeat_task, receive_task)
+            await asyncio.gather(*connection_tasks)
         finally:
-            heartbeat_task.cancel()
-            receive_task.cancel()
-            await asyncio.gather(heartbeat_task, receive_task, return_exceptions=True)
+            for task in connection_tasks:
+                task.cancel()
+            await asyncio.gather(*connection_tasks, return_exceptions=True)
             await browser_runtime.close_all()
             if mcp_host is not None:
                 await mcp_host.on_disconnect()
@@ -1189,6 +1218,7 @@ async def serve_ws(
         raise RuntimeError("Install websockets to use --serve") from exc
     policy = reconnect_policy or ReconnectPolicy()
     mcp_host = LocalMcpHost.from_path(mcp_config) if mcp_config else None
+    outbound_buffer = ReconnectOutboundBuffer()
     renderer = dashboard or TerminalDashboardRenderer(
         TerminalDashboardConfig(
             client_id=client_id,
@@ -1215,6 +1245,7 @@ async def serve_ws(
                     on_connected=lambda: renderer.update("ONLINE", attempt=0),
                     on_dashboard_event=getattr(renderer, "record_event", None),
                     mcp_host=mcp_host,
+                    outbound_buffer=outbound_buffer,
                 )
                 attempt = 0
             except Exception as exc:

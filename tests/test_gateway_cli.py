@@ -308,6 +308,101 @@ def test_send_json_if_connected_ignores_retryable_connection_close() -> None:
     assert asyncio.run(cli.send_json_if_connected(send_json, {"type": "session_failed"}, fake_websockets)) is False
 
 
+def test_reconnect_outbound_buffer_replays_failed_send_in_order() -> None:
+    async def run() -> None:
+        buffer = cli.ReconnectOutboundBuffer(max_messages=4)
+        first = {"type": "session_output", "text": "one"}
+        second = {"type": "session_finished", "exit_code": 0}
+        await buffer.put(first)
+        await buffer.put(second)
+
+        async def fail_once(payload: dict) -> None:
+            assert payload is first
+            raise ConnectionError("restart")
+
+        try:
+            await buffer.send_forever(fail_once)
+        except ConnectionError:
+            pass
+        else:
+            raise NoteError("buffer did not propagate transport failure")
+
+        assert buffer.pending_count() == 2
+        sent: list[dict] = []
+
+        async def send(payload: dict) -> None:
+            sent.append(payload)
+            if len(sent) == 2:
+                raise asyncio.CancelledError()
+
+        try:
+            await buffer.send_forever(send)
+        except asyncio.CancelledError:
+            pass
+
+        assert sent == [first, second]
+        assert buffer.pending_count() == 1
+
+    asyncio.run(run())
+
+
+def test_serve_ws_reuses_outbound_buffer_across_reconnects(monkeypatch, tmp_path: Path) -> None:
+    class InvalidMessage(Exception):
+        pass
+
+    class StopRetry(Exception):
+        pass
+
+    fake_websockets = types.SimpleNamespace(
+        exceptions=types.SimpleNamespace(InvalidMessage=InvalidMessage)
+    )
+    seen: list[cli.ReconnectOutboundBuffer] = []
+
+    async def fake_serve_ws_once(*args, **kwargs) -> None:
+        buffer = kwargs["outbound_buffer"]
+        seen.append(buffer)
+        if len(seen) == 1:
+            await buffer.put({"type": "session_output", "text": "queued"})
+            raise InvalidMessage("restart")
+        assert buffer.pending_count() == 1
+        raise InvalidMessage("second restart")
+
+    sleep_count = 0
+
+    async def fake_sleep(delay: float) -> None:
+        nonlocal sleep_count
+        assert delay == 1.0
+        sleep_count += 1
+        if sleep_count == 2:
+            raise StopRetry()
+
+    monkeypatch.setitem(sys.modules, "websockets", fake_websockets)
+    monkeypatch.setattr(cli, "serve_ws_once", fake_serve_ws_once)
+    monkeypatch.setattr(cli.asyncio, "sleep", fake_sleep)
+
+    try:
+        asyncio.run(
+            cli.serve_ws(
+                "http://gateway",
+                "client-1",
+                "token",
+                ThinClientSandbox(tmp_path),
+                reconnect_policy=cli.ReconnectPolicy(
+                    initial_delay=1.0,
+                    max_delay=1.0,
+                    jitter_ratio=0.0,
+                ),
+            )
+        )
+    except StopRetry:
+        pass
+    else:
+        raise NoteError("serve_ws did not enter the second connection")
+
+    assert len(seen) == 2
+    assert seen[0] is seen[1]
+
+
 def test_send_json_if_connected_reraises_non_transport_error() -> None:
     fake_websockets = types.SimpleNamespace(exceptions=types.SimpleNamespace())
 
