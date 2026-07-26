@@ -44,13 +44,29 @@ def _sha256_json(value: Any) -> str:
     return hashlib.sha256(_canonical_json(value).encode()).hexdigest()
 
 
+def _model_json(value: Any) -> Any:
+    if value is None:
+        return None
+    if hasattr(value, "model_dump"):
+        return value.model_dump(mode="json", by_alias=True, exclude_none=True)
+    return value
+
+
+def _tool_descriptor(tool: types.Tool) -> dict[str, Any]:
+    return {
+        "input": dict(tool.inputSchema or {}),
+        "output": dict(tool.outputSchema) if tool.outputSchema else None,
+        "title": getattr(tool, "title", None),
+        "description": tool.description or "",
+        "annotations": _model_json(tool.annotations) or {},
+        "icons": [_model_json(item) for item in (getattr(tool, "icons", None) or [])],
+        "execution": _model_json(getattr(tool, "execution", None)) or {},
+        "component_meta": dict(getattr(tool, "meta", None) or {}),
+    }
+
+
 def _tool_schema_hash(tool: types.Tool) -> str:
-    return _sha256_json(
-        {
-            "input": dict(tool.inputSchema or {}),
-            "output": dict(tool.outputSchema) if tool.outputSchema else None,
-        }
-    )
+    return _sha256_json(_tool_descriptor(tool))
 
 
 def _identifier(value: Any, name: str) -> str:
@@ -354,7 +370,7 @@ class LocalMcpHost:
     @contextlib.asynccontextmanager
     async def _session(
         self, config: LocalMcpServerConfig
-    ) -> AsyncIterator[ClientSession]:
+    ) -> AsyncIterator[tuple[ClientSession, types.InitializeResult]]:
         if config.transport == "stdio":
             parameters = StdioServerParameters(
                 command=str(config.command),
@@ -370,8 +386,8 @@ class LocalMcpHost:
                         name="gateway-thin-client-local-mcp", version="1"
                     ),
                 ) as session:
-                    await session.initialize()
-                    yield session
+                    initialized = await session.initialize()
+                    yield session, initialized
             return
         headers = _resolved_bindings(config.header_bindings)
         timeout = httpx.Timeout(
@@ -395,12 +411,14 @@ class LocalMcpHost:
                         name="gateway-thin-client-local-mcp", version="1"
                     ),
                 ) as session:
-                    await session.initialize()
-                    yield session
+                    initialized = await session.initialize()
+                    yield session, initialized
 
-    async def _list_tools(self, config: LocalMcpServerConfig) -> list[types.Tool]:
+    async def _list_tools(
+        self, config: LocalMcpServerConfig
+    ) -> tuple[types.InitializeResult, list[types.Tool]]:
         tools: list[types.Tool] = []
-        async with self._session(config) as session:
+        async with self._session(config) as (session, initialized):
             cursor: str | None = None
             while True:
                 page = await session.list_tools(cursor=cursor)
@@ -410,31 +428,33 @@ class LocalMcpHost:
                 cursor = page.nextCursor
                 if not cursor:
                     break
-        return tools
+        return initialized, tools
 
     async def catalog_snapshot(self, local_server_id: str) -> dict[str, Any]:
         config = self.servers[local_server_id]
         state = self.states[local_server_id]
         try:
-            tools = await self._list_tools(config)
-            snapshot = [
-                {
-                    "upstream_name": tool.name,
-                    "input_schema": dict(tool.inputSchema or {}),
-                    "output_schema": dict(tool.outputSchema)
-                    if tool.outputSchema
-                    else None,
-                    "title": getattr(tool, "title", None),
-                    "description": tool.description or "",
-                    "annotations": tool.annotations.model_dump(
-                        by_alias=True, exclude_none=True
-                    )
-                    if tool.annotations
-                    else {},
-                }
-                for tool in tools
-            ]
-            digest = _sha256_json(snapshot)
+            initialized, tools = await self._list_tools(config)
+            snapshot = []
+            for tool in tools:
+                descriptor = _tool_descriptor(tool)
+                snapshot.append(
+                    {
+                        "upstream_name": tool.name,
+                        "input_schema": descriptor["input"],
+                        "output_schema": descriptor["output"],
+                        "title": descriptor["title"],
+                        "description": descriptor["description"],
+                        "annotations": descriptor["annotations"],
+                        "icons": descriptor["icons"],
+                        "execution": descriptor["execution"],
+                        "component_meta": descriptor["component_meta"],
+                    }
+                )
+            server_instructions = str(initialized.instructions or "")
+            digest = _sha256_json(
+                {"tools": snapshot, "server_instructions": server_instructions}
+            )
             if digest != state.snapshot_sha256:
                 state.catalog_generation += 1
                 state.snapshot_sha256 = digest
@@ -448,6 +468,7 @@ class LocalMcpHost:
                 "runtime_id": self.runtime_id,
                 "local_server_id": local_server_id,
                 "catalog_generation": max(1, state.catalog_generation),
+                "server_instructions": server_instructions,
                 "tools": snapshot,
             }
         except Exception:
@@ -476,7 +497,7 @@ class LocalMcpHost:
         config = self.servers[local_server_id]
         metadata = self._call_metadata[request_id]
         try:
-            async with self._session(config) as session:
+            async with self._session(config) as (session, _):
                 tool = await self._find_tool(session, str(message["tool_name"]))
                 if _tool_schema_hash(tool) != str(message["schema_hash"]):
                     raise LocalMcpConfigError(
