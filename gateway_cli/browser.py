@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import base64
+import contextlib
 import json
 import os
 import re
@@ -455,10 +456,8 @@ class ThinClientBrowserRuntime:
             if session is None:
                 continue
             if session.tracing:
-                try:
+                with contextlib.suppress(Exception):
                     await session.context.tracing.stop()
-                except Exception:
-                    pass
             await session.context.close()
             await session.browser.close()
             await session.playwright.stop()

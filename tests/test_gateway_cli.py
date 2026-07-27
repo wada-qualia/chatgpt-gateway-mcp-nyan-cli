@@ -5,10 +5,10 @@ import base64
 import io
 import json
 import subprocess
-from pathlib import Path
 import sys
 import time
 import types
+from pathlib import Path
 from urllib.error import HTTPError, URLError
 
 from gateway_cli import __main__ as cli
@@ -256,8 +256,10 @@ def test_activation_prompt_opens_browser_after_enter(monkeypatch) -> None:
     cli.open_verification_uri_on_enter(url, "107804")
 
     assert prompts == [
-        "Open https://gateway.example/thin-clients/activate and enter code 107804. "
-        "Press ENTER to open the site..."
+        (
+            "Open https://gateway.example/thin-clients/activate and enter code 107804. "
+            "Press ENTER to open the site..."
+        )
     ]
     assert opened == [(url, 2, True)]
 

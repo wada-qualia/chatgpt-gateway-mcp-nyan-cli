@@ -7,15 +7,17 @@ import ipaddress
 import json
 import os
 import re
+from collections.abc import AsyncIterator, Awaitable, Callable
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, AsyncIterator, Awaitable, Callable
+from typing import Any
 from urllib.parse import urlparse
 
 import httpx
 from mcp import ClientSession, StdioServerParameters, types
 from mcp.client.stdio import stdio_client
 from mcp.client.streamable_http import streamable_http_client
+from mcp.shared.exceptions import McpError
 
 MCP_THIN_CLIENT_PROTOCOL_VERSION = "1.0"
 MCP_THIN_CLIENT_CAPABILITIES = (
@@ -155,7 +157,7 @@ class LocalMcpServerConfig:
     call_timeout_seconds: float = 30.0
 
     @classmethod
-    def from_dict(cls, raw: dict[str, Any]) -> "LocalMcpServerConfig":
+    def from_dict(cls, raw: dict[str, Any]) -> LocalMcpServerConfig:
         allowed = {
             "id",
             "display_name",
@@ -274,7 +276,7 @@ class LocalMcpHost:
         self._load_state()
 
     @classmethod
-    def from_path(cls, path: str | Path) -> "LocalMcpHost":
+    def from_path(cls, path: str | Path) -> LocalMcpHost:
         config_path = Path(path).expanduser().resolve()
         try:
             raw = json.loads(config_path.read_text())
@@ -378,16 +380,18 @@ class LocalMcpHost:
                 cwd=config.cwd,
                 env=_resolved_bindings(config.environment_bindings),
             )
-            async with stdio_client(parameters) as (read_stream, write_stream):
-                async with ClientSession(
-                    read_stream,
-                    write_stream,
-                    client_info=types.Implementation(
-                        name="gateway-thin-client-local-mcp", version="1"
-                    ),
-                ) as session:
-                    initialized = await session.initialize()
-                    yield session, initialized
+            async with stdio_client(parameters) as (
+                read_stream,
+                write_stream,
+            ), ClientSession(
+                read_stream,
+                write_stream,
+                client_info=types.Implementation(
+                    name="gateway-thin-client-local-mcp", version="1"
+                ),
+            ) as session:
+                initialized = await session.initialize()
+                yield session, initialized
             return
         headers = _resolved_bindings(config.header_bindings)
         timeout = httpx.Timeout(
@@ -400,19 +404,17 @@ class LocalMcpHost:
             headers=headers,
             timeout=timeout,
             follow_redirects=False,
-        ) as client:
-            async with streamable_http_client(
-                str(config.url), http_client=client, terminate_on_close=True
-            ) as (read_stream, write_stream, _):
-                async with ClientSession(
-                    read_stream,
-                    write_stream,
-                    client_info=types.Implementation(
-                        name="gateway-thin-client-local-mcp", version="1"
-                    ),
-                ) as session:
-                    initialized = await session.initialize()
-                    yield session, initialized
+        ) as client, streamable_http_client(
+            str(config.url), http_client=client, terminate_on_close=True
+        ) as (read_stream, write_stream, _), ClientSession(
+            read_stream,
+            write_stream,
+            client_info=types.Implementation(
+                name="gateway-thin-client-local-mcp", version="1"
+            ),
+        ) as session:
+            initialized = await session.initialize()
+            yield session, initialized
 
     async def _list_tools(
         self, config: LocalMcpServerConfig
@@ -543,7 +545,14 @@ class LocalMcpHost:
                 }
             )
             raise
-        except Exception as exc:
+        except (
+            McpError,
+            OSError,
+            RuntimeError,
+            TypeError,
+            ValueError,
+            httpx.HTTPError,
+        ) as exc:
             unknown = bool(metadata.get("dispatched")) and action_class in {
                 "write",
                 "destructive",

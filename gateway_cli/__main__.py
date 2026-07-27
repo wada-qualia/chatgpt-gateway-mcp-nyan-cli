@@ -16,11 +16,11 @@ from collections import deque
 from dataclasses import dataclass, field
 from pathlib import Path
 from urllib.error import HTTPError, URLError
-from urllib.parse import urljoin, urlencode, urlsplit
+from urllib.parse import urlencode, urljoin, urlsplit
 from urllib.request import Request, urlopen
 
 from . import __version__
-from .browser import BrowserError, ThinClientBrowserRuntime
+from .browser import ThinClientBrowserRuntime
 from .local_mcp import LocalMcpHost
 from .sandbox import SandboxError, ThinClientSandbox
 
@@ -117,9 +117,7 @@ def is_retryable_websocket_error(exc: BaseException, websockets_module: object) 
 
     if retryable_exception_types and isinstance(exc, tuple(retryable_exception_types)):
         status_code = websocket_status_code(exc)
-        if status_code is not None and status_code not in RETRYABLE_WEBSOCKET_HTTP_STATUSES:
-            return False
-        return True
+        return status_code is None or status_code in RETRYABLE_WEBSOCKET_HTTP_STATUSES
 
     return False
 
@@ -750,7 +748,7 @@ def read_jwt_exp(token: str) -> int | None:
         payload = json.loads(base64.urlsafe_b64decode(payload_segment.encode("ascii")))
         exp = payload.get("exp")
         return int(exp) if exp is not None else None
-    except Exception:
+    except (AttributeError, IndexError, TypeError, UnicodeError, ValueError):
         return None
 
 
@@ -912,9 +910,9 @@ def monitor_list(args: argparse.Namespace) -> int:
         if len(command) > 90:
             command = f"{command[:87]}..."
         print(
-            f"{str(session.get('id', '')):36}  "
-            f"{str(session.get('status', '')):14}  "
-            f"{str(session.get('origin', '')):12}  "
+            f"{session.get('id', '')!s:36}  "
+            f"{session.get('status', '')!s:14}  "
+            f"{session.get('origin', '')!s:12}  "
             f"{int(session.get('line_count') or 0):5d}  "
             f"{command}"
         )
@@ -943,7 +941,7 @@ def monitor_tail(args: argparse.Namespace) -> int:
         return 0
     for line in output.get("lines") or []:
         if args.with_metadata:
-            prefix = f"{int(line.get('line', 0)):>6} {str(line.get('stream', 'stdout')):<6} | "
+            prefix = f"{int(line.get('line', 0)):>6} {line.get('stream', 'stdout')!s:<6} | "
         else:
             prefix = ""
         print(f"{prefix}{line.get('text', '')}")
@@ -1115,7 +1113,7 @@ async def serve_ws_once(
                 record_dashboard_event("command", f"monitored command {status}", f"{session_id} exit={exit_code} {truncate_dashboard_text(command, 90)}", status)
             except asyncio.CancelledError:
                 raise
-            except Exception as exc:
+            except (OSError, RuntimeError, SandboxError, ValueError) as exc:
                 record_dashboard_event("command", "monitored command failed", f"{session_id} {exc}", "failed")
                 await send_json_best_effort(
                     {"type": "session_failed", "session_id": session_id, "error": str(exc)}
@@ -1178,7 +1176,7 @@ async def serve_ws_once(
                         result = await asyncio.to_thread(sandbox.call, tool, arguments)
                     record_tool_result(tool, arguments, result=result)
                     await send_json({"type": "tool_result", "request_id": request_id, "ok": True, "result": result})
-                except (BrowserError, Exception) as exc:
+                except (OSError, RuntimeError, SandboxError, TypeError, ValueError) as exc:
                     record_tool_result(tool, arguments, error=str(exc))
                     await send_json({"type": "tool_result", "request_id": request_id, "ok": False, "error": str(exc)})
 
