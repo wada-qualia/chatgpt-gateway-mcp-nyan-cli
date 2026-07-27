@@ -5,12 +5,11 @@ import json
 from pathlib import Path
 
 import pytest
-
 from gateway_cli.local_mcp import (
+    MCP_THIN_CLIENT_PROTOCOL_VERSION,
     LocalMcpConfigError,
     LocalMcpHost,
     LocalMcpServerConfig,
-    MCP_THIN_CLIENT_PROTOCOL_VERSION,
 )
 
 

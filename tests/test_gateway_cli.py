@@ -5,10 +5,10 @@ import base64
 import io
 import json
 import subprocess
-from pathlib import Path
 import sys
 import time
 import types
+from pathlib import Path
 from urllib.error import HTTPError, URLError
 
 from gateway_cli import __main__ as cli
@@ -186,7 +186,7 @@ def test_login_reuses_saved_session_without_device_code(monkeypatch, tmp_path: P
 
 def test_cli_version(capsys) -> None:
     assert cli.main(["version"]) == 0
-    assert "gateway-cli 0.6.0" in capsys.readouterr().out
+    assert "gateway-cli 0.7.0" in capsys.readouterr().out
 
 
 def test_login_falls_back_to_device_code_when_saved_token_is_rejected(monkeypatch, tmp_path: Path, capsys) -> None:
@@ -256,8 +256,10 @@ def test_activation_prompt_opens_browser_after_enter(monkeypatch) -> None:
     cli.open_verification_uri_on_enter(url, "107804")
 
     assert prompts == [
-        "Open https://gateway.example/thin-clients/activate and enter code 107804. "
-        "Press ENTER to open the site..."
+        (
+            "Open https://gateway.example/thin-clients/activate and enter code 107804. "
+            "Press ENTER to open the site..."
+        )
     ]
     assert opened == [(url, 2, True)]
 

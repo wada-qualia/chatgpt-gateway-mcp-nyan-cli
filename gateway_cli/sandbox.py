@@ -98,6 +98,7 @@ class ThinClientSandbox:
                 encoding="utf-8",
                 errors="replace",
                 timeout=15,
+                check=False,
             )
             if check and completed.returncode != 0:
                 detail = (completed.stderr or completed.stdout).strip() or "git command failed"
@@ -409,6 +410,7 @@ class ThinClientSandbox:
                 encoding="utf-8",
                 errors="replace",
                 timeout=max(1, int(timeout_seconds)),
+                check=False,
             )
         except subprocess.TimeoutExpired as exc:
             stdout = exc.stdout if isinstance(exc.stdout, str) else ""
