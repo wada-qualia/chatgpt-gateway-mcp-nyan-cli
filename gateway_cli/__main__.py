@@ -23,6 +23,7 @@ from . import __version__
 from .browser import ThinClientBrowserRuntime
 from .local_mcp import LocalMcpHost
 from .sandbox import SandboxError, ThinClientSandbox
+from .updater import UpdateError, rollback_client, update_client
 
 SESSION_REUSE_MIN_TTL_SECONDS = 60
 WEBSOCKET_RECONNECT_SECONDS = 1.0
@@ -1293,6 +1294,27 @@ def print_version(_: argparse.Namespace) -> int:
     return 0
 
 
+def update_command(args: argparse.Namespace) -> int:
+    try:
+        return update_client(
+            base_url=args.release_base_url,
+            check_only=bool(args.check),
+            force=bool(args.force),
+            skip_browser=bool(args.skip_browser),
+        )
+    except UpdateError as exc:
+        print(f"gateway-cli update: {exc}", file=sys.stderr)
+        return 1
+
+
+def rollback_command(_: argparse.Namespace) -> int:
+    try:
+        return rollback_client()
+    except UpdateError as exc:
+        print(f"gateway-cli rollback: {exc}", file=sys.stderr)
+        return 1
+
+
 def sandbox_call(args: argparse.Namespace) -> int:
     sandbox = ThinClientSandbox(args.directory)
     arguments = json.loads(args.arguments) if args.arguments else {}
@@ -1446,6 +1468,16 @@ def build_parser() -> argparse.ArgumentParser:
 
     version_parser = subparsers.add_parser("version")
     version_parser.set_defaults(func=print_version)
+
+    update_parser = subparsers.add_parser("update")
+    update_parser.add_argument("--check", action="store_true")
+    update_parser.add_argument("--force", action="store_true")
+    update_parser.add_argument("--skip-browser", action="store_true")
+    update_parser.add_argument("--release-base-url")
+    update_parser.set_defaults(func=update_command)
+
+    rollback_parser = subparsers.add_parser("rollback")
+    rollback_parser.set_defaults(func=rollback_command)
 
     sandbox_parser = subparsers.add_parser("sandbox-call")
     sandbox_parser.add_argument("tool", choices=["list_files", "read_file", "write_file", "run_command"])
