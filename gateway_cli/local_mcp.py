@@ -17,7 +17,7 @@ import httpx
 from mcp import ClientSession, StdioServerParameters, types
 from mcp.client.stdio import stdio_client
 from mcp.client.streamable_http import streamable_http_client
-from mcp.shared.exceptions import McpError
+from mcp.shared.exceptions import MCPError
 
 MCP_THIN_CLIENT_PROTOCOL_VERSION = "1.0"
 MCP_THIN_CLIENT_CAPABILITIES = (
@@ -56,8 +56,8 @@ def _model_json(value: Any) -> Any:
 
 def _tool_descriptor(tool: types.Tool) -> dict[str, Any]:
     return {
-        "input": dict(tool.inputSchema or {}),
-        "output": dict(tool.outputSchema) if tool.outputSchema else None,
+        "input": dict(tool.input_schema or {}),
+        "output": dict(tool.output_schema) if tool.output_schema else None,
         "title": getattr(tool, "title", None),
         "description": tool.description or "",
         "annotations": _model_json(tool.annotations) or {},
@@ -245,6 +245,12 @@ class LocalMcpServerConfig:
         }
 
 
+@dataclass(frozen=True, slots=True)
+class LocalMcpHandshake:
+    protocol_version: str
+    instructions: str
+
+
 @dataclass
 class LocalMcpServerState:
     catalog_generation: int = 0
@@ -369,10 +375,31 @@ class LocalMcpHost:
             ],
         }
 
+    async def _negotiate_session(self, session: ClientSession) -> LocalMcpHandshake:
+        try:
+            discovered = await session.discover()
+        except MCPError as exc:
+            if exc.code != -32601:
+                raise
+            initialized = await session.initialize()
+            return LocalMcpHandshake(
+                protocol_version=initialized.protocol_version,
+                instructions=str(initialized.instructions or ""),
+            )
+        protocol_version = session.protocol_version
+        if not isinstance(protocol_version, str) or not protocol_version:
+            raise LocalMcpConfigError(
+                "Local MCP discovery did not establish a protocol version"
+            )
+        return LocalMcpHandshake(
+            protocol_version=protocol_version,
+            instructions=str(discovered.instructions or ""),
+        )
+
     @contextlib.asynccontextmanager
     async def _session(
         self, config: LocalMcpServerConfig
-    ) -> AsyncIterator[tuple[ClientSession, types.InitializeResult]]:
+    ) -> AsyncIterator[tuple[ClientSession, LocalMcpHandshake]]:
         if config.transport == "stdio":
             parameters = StdioServerParameters(
                 command=str(config.command),
@@ -390,8 +417,8 @@ class LocalMcpHost:
                     name="gateway-thin-client-local-mcp", version="1"
                 ),
             ) as session:
-                initialized = await session.initialize()
-                yield session, initialized
+                handshake = await self._negotiate_session(session)
+                yield session, handshake
             return
         headers = _resolved_bindings(config.header_bindings)
         timeout = httpx.Timeout(
@@ -406,37 +433,37 @@ class LocalMcpHost:
             follow_redirects=False,
         ) as client, streamable_http_client(
             str(config.url), http_client=client, terminate_on_close=True
-        ) as (read_stream, write_stream, _), ClientSession(
+        ) as (read_stream, write_stream), ClientSession(
             read_stream,
             write_stream,
             client_info=types.Implementation(
                 name="gateway-thin-client-local-mcp", version="1"
             ),
         ) as session:
-            initialized = await session.initialize()
-            yield session, initialized
+            handshake = await self._negotiate_session(session)
+            yield session, handshake
 
     async def _list_tools(
         self, config: LocalMcpServerConfig
-    ) -> tuple[types.InitializeResult, list[types.Tool]]:
+    ) -> tuple[LocalMcpHandshake, list[types.Tool]]:
         tools: list[types.Tool] = []
-        async with self._session(config) as (session, initialized):
+        async with self._session(config) as (session, handshake):
             cursor: str | None = None
             while True:
-                page = await session.list_tools(cursor=cursor)
+                page = await session.list_tools(params=types.PaginatedRequestParams(cursor=cursor) if cursor else None)
                 tools.extend(page.tools)
                 if len(tools) > 500:
                     raise LocalMcpConfigError("Local MCP catalog exceeds 500 tools")
-                cursor = page.nextCursor
+                cursor = page.next_cursor
                 if not cursor:
                     break
-        return initialized, tools
+        return handshake, tools
 
     async def catalog_snapshot(self, local_server_id: str) -> dict[str, Any]:
         config = self.servers[local_server_id]
         state = self.states[local_server_id]
         try:
-            initialized, tools = await self._list_tools(config)
+            handshake, tools = await self._list_tools(config)
             snapshot = []
             for tool in tools:
                 descriptor = _tool_descriptor(tool)
@@ -453,7 +480,7 @@ class LocalMcpHost:
                         "component_meta": descriptor["component_meta"],
                     }
                 )
-            server_instructions = str(initialized.instructions or "")
+            server_instructions = handshake.instructions
             digest = _sha256_json(
                 {"tools": snapshot, "server_instructions": server_instructions}
             )
@@ -465,7 +492,7 @@ class LocalMcpHost:
             return {
                 "type": "mcp_catalog_snapshot",
                 "protocol_version": MCP_THIN_CLIENT_PROTOCOL_VERSION,
-                "mcp_protocol_version": "2025-11-25",
+                "mcp_protocol_version": handshake.protocol_version,
                 "connection_instance_id": self.connection_instance_id,
                 "runtime_id": self.runtime_id,
                 "local_server_id": local_server_id,
@@ -480,11 +507,11 @@ class LocalMcpHost:
     async def _find_tool(self, session: ClientSession, name: str) -> types.Tool:
         cursor: str | None = None
         while True:
-            page = await session.list_tools(cursor=cursor)
+            page = await session.list_tools(params=types.PaginatedRequestParams(cursor=cursor) if cursor else None)
             for tool in page.tools:
                 if tool.name == name:
                     return tool
-            cursor = page.nextCursor
+            cursor = page.next_cursor
             if not cursor:
                 raise LocalMcpConfigError("Local MCP tool no longer exists")
 
@@ -546,7 +573,7 @@ class LocalMcpHost:
             )
             raise
         except (
-            McpError,
+            MCPError,
             OSError,
             RuntimeError,
             TypeError,
