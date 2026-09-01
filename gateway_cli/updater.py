@@ -17,7 +17,7 @@ from urllib.request import Request, urlopen
 
 from . import __version__
 
-DEFAULT_RELEASE_BASE_URL = "https://releases.example.com/artem.darius.weber/2026q3-int-art-chatgpt-gateway-thin-client-distribution/-/releases/permalink/latest/downloads"
+DEFAULT_RELEASE_BASE_URL = "https://github.com/wada-qualia/chatgpt-gateway-mcp-nyan-cli/releases/latest/download"
 RELEASE_NAMESPACE = "gateway-thin-client-release"
 RELEASE_IDENTITY = "gateway-thin-client"
 RELEASE_ARTIFACT = "chatgpt-gateway-thin-client"

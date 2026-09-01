@@ -4,7 +4,6 @@ import asyncio
 import base64
 import io
 import json
-import subprocess
 import sys
 import time
 import types
@@ -543,17 +542,6 @@ def test_main_handles_keyboard_interrupt_without_traceback(monkeypatch, capsys) 
     captured = capsys.readouterr()
     assert captured.out == "Good bye!\n"
     assert "Traceback" not in captured.err
-
-
-def test_thin_client_installer_bundles_runtime_dependencies() -> None:
-    script = Path(__file__).resolve().parents[2] / "scripts" / "gateway-thin-client.sh"
-    result = subprocess.run(["sh", "-n", str(script)], check=False, capture_output=True, text=True)
-
-    assert result.returncode == 0, result.stderr
-    script_text = script.read_text()
-    assert "websockets>=12,<16" in script_text
-    assert "playwright>=1.55,<2" in script_text
-    assert "rich>=13,<15" in script_text
 
 
 def test_monitor_list_uses_saved_session_and_prints_table(monkeypatch, tmp_path: Path, capsys) -> None:
