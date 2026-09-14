@@ -185,7 +185,7 @@ def test_login_reuses_saved_session_without_device_code(monkeypatch, tmp_path: P
 
 def test_cli_version(capsys) -> None:
     assert cli.main(["version"]) == 0
-    assert "gateway-cli 0.9.0" in capsys.readouterr().out
+    assert "gateway-cli 0.9.6" in capsys.readouterr().out
 
 
 def test_login_falls_back_to_device_code_when_saved_token_is_rejected(monkeypatch, tmp_path: Path, capsys) -> None:
@@ -307,6 +307,72 @@ def test_send_json_if_connected_ignores_retryable_connection_close() -> None:
         raise ConnectionClosedError("keepalive ping timeout")
 
     assert asyncio.run(cli.send_json_if_connected(send_json, {"type": "session_failed"}, fake_websockets)) is False
+
+
+def test_stream_session_output_batches_dense_lines_without_reordering() -> None:
+    async def run() -> None:
+        reader = asyncio.StreamReader()
+        expected = b"".join(f"line-{index}\n".encode() for index in range(100))
+        reader.feed_data(expected)
+        reader.feed_eof()
+        sent: list[dict] = []
+
+        async def send(payload: dict) -> None:
+            sent.append(payload)
+
+        await cli._stream_session_output(
+            "session-1",
+            "stdout",
+            reader,
+            send,
+            max_lines=32,
+            max_bytes=64 * 1024,
+            flush_seconds=1.0,
+        )
+
+        assert 1 < len(sent) <= 4
+        assert all(item["type"] == "session_output" for item in sent)
+        assert all(item["session_id"] == "session-1" for item in sent)
+        assert all(item["stream"] == "stdout" for item in sent)
+        assert "".join(item["text"] for item in sent).encode() == expected
+        assert all(len(item["text"].splitlines()) <= 32 for item in sent)
+
+    asyncio.run(run())
+
+
+def test_stream_session_output_flushes_sparse_line_before_eof() -> None:
+    async def run() -> None:
+        reader = asyncio.StreamReader()
+        sent: list[dict] = []
+        delivered = asyncio.Event()
+
+        async def send(payload: dict) -> None:
+            sent.append(payload)
+            delivered.set()
+
+        task = asyncio.create_task(
+            cli._stream_session_output(
+                "session-2",
+                "stderr",
+                reader,
+                send,
+                flush_seconds=0.01,
+            )
+        )
+        reader.feed_data(b"one\n")
+        await asyncio.wait_for(delivered.wait(), timeout=0.2)
+        assert sent == [
+            {
+                "type": "session_output",
+                "session_id": "session-2",
+                "stream": "stderr",
+                "text": "one\n",
+            }
+        ]
+        reader.feed_eof()
+        await asyncio.wait_for(task, timeout=0.2)
+
+    asyncio.run(run())
 
 
 def test_reconnect_outbound_buffer_replays_failed_send_in_order() -> None:
@@ -527,6 +593,87 @@ def test_serve_ws_once_consumes_background_failure_when_transport_closes(monkeyp
     assert browser_closed == [True]
     assert loop_errors == []
 
+
+
+def test_serve_ws_once_clean_remote_close_exits_connection_scope(monkeypatch, tmp_path: Path) -> None:
+    class FakeWebSocket:
+        def __init__(self) -> None:
+            self.sent: list[dict] = []
+
+        async def send(self, raw: str) -> None:
+            self.sent.append(json.loads(raw))
+
+        def __aiter__(self):
+            return self.messages()
+
+        async def messages(self):
+            if False:
+                yield ""
+
+    class FakeConnectionContext:
+        def __init__(self, websocket: FakeWebSocket) -> None:
+            self.websocket = websocket
+
+        async def __aenter__(self) -> FakeWebSocket:
+            return self.websocket
+
+        async def __aexit__(self, exc_type, exc, traceback_value) -> bool:
+            return False
+
+    class FakeBrowserRuntime:
+        def __init__(self, root: Path) -> None:
+            self.root = root
+
+        async def close_all(self) -> None:
+            browser_closed.append(True)
+
+    websocket = FakeWebSocket()
+    browser_closed: list[bool] = []
+    fake_websockets = types.SimpleNamespace(
+        connect=lambda *args, **kwargs: FakeConnectionContext(websocket),
+        exceptions=types.SimpleNamespace(),
+    )
+
+    async def run() -> None:
+        try:
+            await asyncio.wait_for(
+                cli.serve_ws_once(
+                    "http://gateway",
+                    "client-1",
+                    "token",
+                    ThinClientSandbox(tmp_path),
+                ),
+                timeout=0.5,
+            )
+        except EOFError as exc:
+            assert str(exc) == "WebSocket connection closed"
+        except TimeoutError as exc:
+            raise NoteError("serve_ws_once stalled after a clean remote WebSocket close") from exc
+        else:
+            raise NoteError("serve_ws_once treated clean remote WebSocket close as a live connection")
+
+    monkeypatch.setitem(sys.modules, "websockets", fake_websockets)
+    monkeypatch.setattr(cli, "ThinClientBrowserRuntime", FakeBrowserRuntime)
+
+    asyncio.run(run())
+
+    assert any(payload.get("type") == "heartbeat" for payload in websocket.sent)
+    assert browser_closed == [True]
+
+
+def test_reconnect_policy_saturates_without_overflow_after_long_outage() -> None:
+    policy = cli.ReconnectPolicy(
+        initial_delay=1.0, max_delay=30.0, factor=2.0, jitter_ratio=0.0
+    )
+
+    assert policy.delay_for_attempt(10_000) == 30.0
+
+
+def test_websocket_eof_is_retryable() -> None:
+    assert cli.is_retryable_websocket_error(
+        EOFError("WebSocket connection closed"),
+        types.SimpleNamespace(exceptions=types.SimpleNamespace()),
+    )
 
 def test_main_handles_keyboard_interrupt_without_traceback(monkeypatch, capsys) -> None:
     def interrupt(_args) -> int:

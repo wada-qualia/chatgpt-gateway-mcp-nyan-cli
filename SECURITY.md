@@ -16,6 +16,12 @@ For remote-execution use:
 - remove unrelated credentials from the process environment;
 - do not run as root or Administrator unless that privilege is explicitly required and understood.
 
+## Local MCP roots and private transport
+
+Local MCP configuration is host-owned. A Gateway message cannot supply or override local MCP URLs, commands, environment bindings, headers or raw filesystem root paths. Configured roots are represented to the Gateway by SHA-256 identity plus bounded redacted metadata; the raw path/URI remains local and is returned only to an approved local MCP server through the protocol roots back-channel. Pending, revoked, expired or stale grants are not root authority.
+
+Loopback and explicitly approved private HTTP MCP sessions disable environment-proxy discovery. The client connects to the configured local/private endpoint directly instead of allowing ambient proxy variables to redirect that trust boundary.
+
 ## Browser automation
 
 The browser integration uses a dedicated Playwright browser session. Do not import a personal browser profile, cookies or saved passwords into that session.

@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "chatgpt-gateway-mcp-nyan-cli"
-version = "0.9.0"
+version = "0.9.6"
 description = "Standalone CLI and thin client for ChatGPT Gateway MCP Nyan."
 readme = "README.md"
 license = "MIT"

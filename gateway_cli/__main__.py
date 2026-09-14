@@ -49,7 +49,11 @@ class ReconnectPolicy:
 
     def delay_for_attempt(self, attempt: int) -> float:
         safe_attempt = max(1, attempt)
-        base = min(self.max_delay, self.initial_delay * (self.factor ** (safe_attempt - 1)))
+        try:
+            exponential_delay = self.initial_delay * (self.factor ** (safe_attempt - 1))
+        except OverflowError:
+            exponential_delay = self.max_delay
+        base = min(self.max_delay, exponential_delay)
         if self.jitter_ratio <= 0:
             return base
         spread = base * self.jitter_ratio
@@ -291,6 +295,57 @@ class ReconnectOutboundBuffer:
 
     def pending_count(self) -> int:
         return len(self._items)
+
+
+_SESSION_OUTPUT_BATCH_MAX_LINES = 32
+_SESSION_OUTPUT_BATCH_MAX_BYTES = 64 * 1024
+_SESSION_OUTPUT_BATCH_FLUSH_SECONDS = 0.1
+
+
+async def _stream_session_output(
+    session_id: str,
+    stream_name: str,
+    reader: asyncio.StreamReader | None,
+    send_payload,
+    *,
+    max_lines: int = _SESSION_OUTPUT_BATCH_MAX_LINES,
+    max_bytes: int = _SESSION_OUTPUT_BATCH_MAX_BYTES,
+    flush_seconds: float = _SESSION_OUTPUT_BATCH_FLUSH_SECONDS,
+) -> None:
+    if reader is None:
+        return
+    if max_lines < 1 or max_bytes < 1 or flush_seconds <= 0:
+        raise ValueError("session output batch limits must be positive")
+    loop = asyncio.get_running_loop()
+    reached_eof = False
+    while not reached_eof:
+        first = await reader.readline()
+        if not first:
+            break
+        chunks = [first]
+        total_bytes = len(first)
+        deadline = loop.time() + flush_seconds
+        while len(chunks) < max_lines and total_bytes < max_bytes:
+            remaining = deadline - loop.time()
+            if remaining <= 0:
+                break
+            try:
+                raw = await asyncio.wait_for(reader.readline(), timeout=remaining)
+            except TimeoutError:
+                break
+            if not raw:
+                reached_eof = True
+                break
+            chunks.append(raw)
+            total_bytes += len(raw)
+        await send_payload(
+            {
+                "type": "session_output",
+                "session_id": session_id,
+                "stream": stream_name,
+                "text": b"".join(chunks).decode("utf-8", errors="replace"),
+            }
+        )
 
 
 class TerminalDashboardRenderer:
@@ -1055,20 +1110,12 @@ async def serve_ws_once(
             record_dashboard_event("tool", title, truncate_dashboard_text(target, 120), "success")
 
         async def stream_process_output(session_id: str, stream_name: str, reader: asyncio.StreamReader | None) -> None:
-            if reader is None:
-                return
-            while True:
-                raw = await reader.readline()
-                if not raw:
-                    break
-                await send_json_best_effort(
-                    {
-                        "type": "session_output",
-                        "session_id": session_id,
-                        "stream": stream_name,
-                        "text": raw.decode("utf-8", errors="replace"),
-                    }
-                )
+            await _stream_session_output(
+                session_id,
+                stream_name,
+                reader,
+                send_json_best_effort,
+            )
 
         async def run_monitored_command(request_id: str, arguments: dict) -> None:
             session_id = str(arguments.get("session_id", ""))
@@ -1186,7 +1233,12 @@ async def serve_ws_once(
         outbound_sender_task = asyncio.create_task(reconnect_buffer.send_forever(send_json))
         connection_tasks = (heartbeat_task, receive_task, outbound_sender_task)
         try:
-            await asyncio.gather(*connection_tasks)
+            done, _ = await asyncio.wait(
+                connection_tasks, return_when=asyncio.FIRST_COMPLETED
+            )
+            for task in done:
+                await task
+            raise EOFError("WebSocket connection closed")
         finally:
             for task in connection_tasks:
                 task.cancel()

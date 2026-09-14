@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 from pathlib import Path
 
 import pytest
@@ -106,7 +107,9 @@ def test_local_config_rejects_unapproved_or_public_network_targets(
         )
 
 
-def test_runtime_hello_and_metadata_state_survive_reconnect(tmp_path: Path) -> None:
+def test_runtime_hello_and_metadata_state_survive_reconnect(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     config = LocalMcpServerConfig.from_dict(
         {
             "id": "loopback-a",
@@ -121,6 +124,11 @@ def test_runtime_hello_and_metadata_state_survive_reconnect(tmp_path: Path) -> N
 
     async def send(payload: dict) -> None:
         sent.append(payload)
+
+    async def no_notification_listeners(_send) -> None:
+        return None
+
+    monkeypatch.setattr(host, "_start_notification_listeners", no_notification_listeners)
 
     assert asyncio.run(
         host.handle_gateway_message(
@@ -142,4 +150,35 @@ def test_runtime_hello_and_metadata_state_survive_reconnect(tmp_path: Path) -> N
     )
     assert restored.states["loopback-a"].catalog_generation == 7
     assert restored.states["loopback-a"].snapshot_sha256 == "b" * 64
-    assert state_path.stat().st_mode & 0o777 == 0o600
+    if os.name != "nt":
+        assert state_path.stat().st_mode & 0o777 == 0o600
+
+
+def test_http_session_disables_environment_proxies(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = LocalMcpServerConfig.from_dict(
+        {
+            "id": "loopback-a",
+            "transport": "streamable_http",
+            "url": "http://127.0.0.1:9000/mcp",
+        }
+    )
+    host = LocalMcpHost(
+        runtime_id="runtime-a", servers=[config], state_path=tmp_path / "state.json"
+    )
+    captured: dict[str, object] = {}
+
+    def fake_async_client(**kwargs):
+        captured.update(kwargs)
+        raise RuntimeError("client-construction-stop")
+
+    monkeypatch.setattr("gateway_cli.local_mcp.httpx.AsyncClient", fake_async_client)
+
+    async def exercise() -> None:
+        with pytest.raises(RuntimeError, match="client-construction-stop"):
+            async with host._session(config):
+                pass
+
+    asyncio.run(exercise())
+    assert captured["trust_env"] is False
