@@ -46,7 +46,11 @@ See [SECURITY.md](SECURITY.md) for the complete boundary.
 
 ## Local MCP bridging
 
-The client can expose local MCP servers to the Gateway while preserving a stable descriptor hash for tool metadata. Local child-process environment/header bindings are explicit and bounded.
+The client can expose explicitly configured local MCP servers to the Gateway while preserving stable descriptor hashes for tool metadata. Local child-process environment/header bindings remain explicit and bounded.
+
+The local runtime can federate tools, resources, prompts and completions. Filesystem roots are opt-in and remain host-owned: the Gateway receives only a SHA-256 root identity, a bounded display name and a redacted hint for review/policy binding. The raw local path/URI is used only inside the thin-client MCP session after the corresponding root grant is approved.
+
+Loopback and explicitly approved private HTTP MCP transports do not inherit ambient HTTP_PROXY, HTTPS_PROXY or ALL_PROXY settings. This prevents a configured local/private endpoint from being silently redirected through a process-level proxy.
 
 ## Updates
 
